@@ -1,0 +1,2912 @@
+From 1d119e80857a77529dbec90897226250914945ac Mon Sep 17 00:00:00 2001
+From: Denis Laxalde <denis.laxalde@dalibo.com>
+Date: Fri, 5 Jul 2024 15:54:16 +0200
+Subject: [PATCH] Grant/revoke role membership in a database
+
+This adds a 'IN DATABASE <datname>' clause to GRANT/REVOKE commands
+allowing to control role membership in a database scope. A major use
+case is probably in combination with predefined roles, e.g.:
+
+  GRANT pg_read_all_data TO bob IN DATABASE app;
+  GRANT pg_maintain TO dba IN DATABASE metrics;
+
+to avoid granting too many privileges when a user is supposed to only
+operate on a subset of the cluster's databases.
+
+The information about which database a role membership applies to is
+stored in a new 'dbid' column of pg_auth_members catalog. When this
+column is 0 (InvalidOid), the membership applies cluster-wise. Indexes
+on this table are modified in order to include the new column to match
+actual queries.
+
+In roles_is_member_of(), the membership lookup is now performed first
+for the database at stake, and then possibly repeated without a database
+id for the cluster-wise case. The repetition of this operation is
+factored out into a new append_role_memberships() helper function where
+the previous logic now lives.
+
+Function has_privs_of_role() now accepts a database id, as last
+argument. For cases where a cluster-wise membership is sought, e.g. for
+roles like 'pg_read_server_files', the new has_cluster_privs_of_role()
+macro is used. The is_admin_of_role() function is modified similarly.
+
+Original author: Kenaniah Cerny <kenaniah@gmail.com>.
+---
+ .../basebackup_to_shell/basebackup_to_shell.c |   2 +-
+ contrib/file_fdw/file_fdw.c                   |   4 +-
+ .../pg_stat_statements/pg_stat_statements.c   |   2 +-
+ contrib/pgrowlocks/pgrowlocks.c               |   2 +-
+ doc/src/sgml/catalogs.sgml                    |  20 +-
+ doc/src/sgml/ref/grant.sgml                   |  46 +-
+ doc/src/sgml/ref/revoke.sgml                  |   9 +
+ doc/src/sgml/user-manag.sgml                  |  14 +
+ src/backend/backup/basebackup_server.c        |   2 +-
+ src/backend/catalog/aclchk.c                  |  14 +-
+ src/backend/catalog/catalog.c                 |   4 +-
+ src/backend/catalog/namespace.c               |   2 +-
+ src/backend/catalog/objectaddress.c           |   2 +-
+ src/backend/commands/alter.c                  |   6 +-
+ src/backend/commands/copy.c                   |   6 +-
+ src/backend/commands/dbcommands.c             |   6 +
+ src/backend/commands/indexcmds.c              |   4 +-
+ src/backend/commands/subscriptioncmds.c       |   2 +-
+ src/backend/commands/user.c                   | 148 +++-
+ src/backend/parser/gram.y                     |  33 +-
+ src/backend/replication/walreceiver.c         |   2 +-
+ src/backend/replication/walsender.c           |   2 +-
+ src/backend/rewrite/rowsecurity.c             |   2 +-
+ src/backend/storage/ipc/procarray.c           |   4 +-
+ src/backend/storage/ipc/signalfuncs.c         |   6 +-
+ src/backend/tcop/utility.c                    |   2 +-
+ src/backend/utils/adt/acl.c                   | 147 ++--
+ src/backend/utils/adt/dbsize.c                |   4 +-
+ src/backend/utils/adt/genfile.c               |   2 +-
+ src/backend/utils/adt/pgstatfuncs.c           |   2 +-
+ src/backend/utils/cache/catcache.c            |   2 +-
+ src/backend/utils/cache/relcache.c            |   2 +-
+ src/backend/utils/init/postinit.c             |   2 +-
+ src/backend/utils/misc/guc_funcs.c            |   4 +-
+ src/bin/pg_dump/pg_dumpall.c                  |  18 +-
+ src/include/catalog/pg_auth_members.h         |  10 +-
+ src/include/commands/user.h                   |   1 +
+ src/include/nodes/parsenodes.h                |   3 +
+ src/include/utils/acl.h                       |   7 +-
+ src/test/regress/expected/oidjoins.out        |   1 +
+ src/test/regress/expected/privs_in_db.out     | 767 ++++++++++++++++++
+ src/test/regress/parallel_schedule            |   2 +-
+ src/test/regress/sql/privs_in_db.sql          | 370 +++++++++
+ 43 files changed, 1518 insertions(+), 172 deletions(-)
+ create mode 100644 src/test/regress/expected/privs_in_db.out
+ create mode 100644 src/test/regress/sql/privs_in_db.sql
+
+diff --git a/contrib/basebackup_to_shell/basebackup_to_shell.c b/contrib/basebackup_to_shell/basebackup_to_shell.c
+index fe419d90806..d35e2f61c27 100644
+--- a/contrib/basebackup_to_shell/basebackup_to_shell.c
++++ b/contrib/basebackup_to_shell/basebackup_to_shell.c
+@@ -104,7 +104,7 @@ shell_check_detail(char *target, char *target_detail)
+ 
+ 		StartTransactionCommand();
+ 		roleid = get_role_oid(shell_required_role, true);
+-		if (!has_privs_of_role(GetUserId(), roleid))
++		if (!has_cluster_privs_of_role(GetUserId(), roleid))
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 					 errmsg("permission denied to use basebackup_to_shell")));
+diff --git a/contrib/file_fdw/file_fdw.c b/contrib/file_fdw/file_fdw.c
+index 043204c3e7e..d323f48d2ce 100644
+--- a/contrib/file_fdw/file_fdw.c
++++ b/contrib/file_fdw/file_fdw.c
+@@ -279,7 +279,7 @@ file_fdw_validator(PG_FUNCTION_ARGS)
+ 			 * otherwise there'd still be a security hole.
+ 			 */
+ 			if (strcmp(def->defname, "filename") == 0 &&
+-				!has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
++				!has_cluster_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
+ 				ereport(ERROR,
+ 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 						 errmsg("permission denied to set the \"%s\" option of a file_fdw foreign table",
+@@ -288,7 +288,7 @@ file_fdw_validator(PG_FUNCTION_ARGS)
+ 								   "pg_read_server_files")));
+ 
+ 			if (strcmp(def->defname, "program") == 0 &&
+-				!has_privs_of_role(GetUserId(), ROLE_PG_EXECUTE_SERVER_PROGRAM))
++				!has_cluster_privs_of_role(GetUserId(), ROLE_PG_EXECUTE_SERVER_PROGRAM))
+ 				ereport(ERROR,
+ 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 						 errmsg("permission denied to set the \"%s\" option of a file_fdw foreign table",
+diff --git a/contrib/pg_stat_statements/pg_stat_statements.c b/contrib/pg_stat_statements/pg_stat_statements.c
+index 5765ef49b4c..26c3f8f992c 100644
+--- a/contrib/pg_stat_statements/pg_stat_statements.c
++++ b/contrib/pg_stat_statements/pg_stat_statements.c
+@@ -1644,7 +1644,7 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
+ 	 * Superusers or roles with the privileges of pg_read_all_stats members
+ 	 * are allowed
+ 	 */
+-	is_allowed_role = has_privs_of_role(userid, ROLE_PG_READ_ALL_STATS);
++	is_allowed_role = has_cluster_privs_of_role(userid, ROLE_PG_READ_ALL_STATS);
+ 
+ 	/* hash table must exist already */
+ 	if (!pgss || !pgss_hash)
+diff --git a/contrib/pgrowlocks/pgrowlocks.c b/contrib/pgrowlocks/pgrowlocks.c
+index adbc8279c3f..3c82e634788 100644
+--- a/contrib/pgrowlocks/pgrowlocks.c
++++ b/contrib/pgrowlocks/pgrowlocks.c
+@@ -104,7 +104,7 @@ pgrowlocks(PG_FUNCTION_ARGS)
+ 	aclresult = pg_class_aclcheck(RelationGetRelid(rel), GetUserId(),
+ 								  ACL_SELECT);
+ 	if (aclresult != ACLCHECK_OK)
+-		aclresult = has_privs_of_role(GetUserId(), ROLE_PG_STAT_SCAN_TABLES) ? ACLCHECK_OK : ACLCHECK_NO_PRIV;
++		aclresult = has_privs_of_role(GetUserId(), ROLE_PG_STAT_SCAN_TABLES, MyDatabaseId) ? ACLCHECK_OK : ACLCHECK_NO_PRIV;
+ 
+ 	if (aclresult != ACLCHECK_OK)
+ 		aclcheck_error(aclresult, get_relkind_objtype(rel->rd_rel->relkind),
+diff --git a/doc/src/sgml/catalogs.sgml b/doc/src/sgml/catalogs.sgml
+index 964c819a02d..a40c4f0d5a8 100644
+--- a/doc/src/sgml/catalogs.sgml
++++ b/doc/src/sgml/catalogs.sgml
+@@ -1648,11 +1648,10 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
+   </para>
+ 
+   <para>
+-   Because user identities are cluster-wide,
+-   <structname>pg_auth_members</structname>
+-   is shared across all databases of a cluster: there is only one
+-   copy of <structname>pg_auth_members</structname> per cluster, not
+-   one per database.
++   User identities are cluster-wide, but role memberships can be either
++   cluster-wide or database-specific (as specified by the value of the
++   <structfield>dbid</structfield> column).  The <structname>pg_auth_members</structname>
++   catalog is shared across all databases of a cluster.
+   </para>
+ 
+   <table>
+@@ -1739,6 +1738,17 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
+        to the granted role
+       </para></entry>
+      </row>
++
++      <row>
++      <entry role="catalog_table_entry"><para role="column_definition">
++       <structfield>dbid</structfield> <type>oid</type>
++       (references <link linkend="catalog-pg-database"><structname>pg_database</structname></link>.<structfield>oid</structfield>)
++      </para>
++      <para>
++       ID of the database that this membership is constrained to; zero if membership is cluster-wide
++      </para></entry>
++     </row>
++
+     </tbody>
+    </tgroup>
+   </table>
+diff --git a/doc/src/sgml/ref/grant.sgml b/doc/src/sgml/ref/grant.sgml
+index 999f657d5c0..b53cae4c14e 100644
+--- a/doc/src/sgml/ref/grant.sgml
++++ b/doc/src/sgml/ref/grant.sgml
+@@ -98,6 +98,7 @@ GRANT { USAGE | ALL [ PRIVILEGES ] }
+     [ GRANTED BY <replaceable class="parameter">role_specification</replaceable> ]
+ 
+ GRANT <replaceable class="parameter">role_name</replaceable> [, ...] TO <replaceable class="parameter">role_specification</replaceable> [, ...]
++    [ IN DATABASE <replaceable class="parameter">database_name</replaceable> | IN CURRENT DATABASE ]
+     [ WITH { ADMIN | INHERIT | SET } { OPTION | TRUE | FALSE } ]
+     [ GRANTED BY <replaceable class="parameter">role_specification</replaceable> ]
+ 
+@@ -262,6 +263,27 @@ GRANT <replaceable class="parameter">role_name</replaceable> [, ...] TO <replace
+    option values.
+   </para>
+ 
++  <para>
++   Membership is effective cluster-wide unless otherwise constrained
++   through the use of a database-specific clause.  Both database-specific and
++   cluster-wide versions of a role membership grant may exist at the same
++   time.  In the event that multiple grants apply, the membership privileges
++   conferred are additive.
++  </para>
++
++  <para>
++   If <literal>IN DATABASE <replaceable class="parameter">database_name</replaceable></literal>
++   is specified, membership in <replaceable class="parameter">role_name</replaceable>
++   will be effective only when the recipient is connected to the database specified by
++   <replaceable class="parameter">database_name</replaceable>.
++  </para>
++
++  <para>
++   If <literal>IN CURRENT DATABASE</literal> is specified, the membership in
++   <replaceable class="parameter">role_name</replaceable> will be effective only when the
++   recipient is connected to the same database that the grant was issued in.
++  </para>
++
+   <para>
+    Each of the options described below can be set to either
+    <literal>TRUE</literal> or <literal>FALSE</literal>. The keyword
+@@ -279,7 +301,15 @@ GRANT <replaceable class="parameter">role_name</replaceable> [, ...] TO <replace
+    do that.  A role is not considered to hold <literal>WITH ADMIN
+    OPTION</literal> on itself.  Database superusers can grant or revoke
+    membership in any role to anyone. This option defaults to
+-   <literal>FALSE</literal>.
++   <literal>FALSE</literal>.  A cluster-wide admin option for the role being granted
++   is required for performing both cluster-wide role membership grants as well as
++   database-specific role membership grants when connected to a database that is not
++   the target of the grant.  A database-specific admin option is only sufficient for
++   performing a role membership grant that is both database-specific and for the
++   currently connected database.  Database-specific admin options can not be
++   used to grant cluster-wide role membership, nor can they be used to grant
++   database-specific role membership for other databases than the currently
++   connected database.
+   </para>
+ 
+   <para>
+@@ -335,6 +365,10 @@ GRANT <replaceable class="parameter">role_name</replaceable> [, ...] TO <replace
+    does not allow the noise word <literal>GROUP</literal>
+    in <replaceable class="parameter">role_specification</replaceable>.
+   </para>
++
++  <para>
++   See <xref linkend="role-membership"/> for more information about role memberships.
++  </para>
+  </refsect2>
+  </refsect1>
+ 
+@@ -456,10 +490,18 @@ GRANT ALL PRIVILEGES ON kinds TO manuel;
+   </para>
+ 
+   <para>
+-   Grant membership in role <literal>admins</literal> to user <literal>joe</literal>:
++   Grant cluster-wide membership in role <literal>admins</literal> to user <literal>joe</literal>:
+ 
+ <programlisting>
+ GRANT admins TO joe;
++</programlisting></para>
++
++  <para>
++   Grant read and write access to user <literal>alice</literal> in the database
++   named <literal>sales</literal>:
++
++<programlisting>
++GRANT pg_read_all_data, pg_write_all_data TO alice IN DATABASE sales;
+ </programlisting></para>
+  </refsect1>
+ 
+diff --git a/doc/src/sgml/ref/revoke.sgml b/doc/src/sgml/ref/revoke.sgml
+index 8df492281a1..00fce4997b5 100644
+--- a/doc/src/sgml/ref/revoke.sgml
++++ b/doc/src/sgml/ref/revoke.sgml
+@@ -127,6 +127,7 @@ REVOKE [ GRANT OPTION FOR ]
+ 
+ REVOKE [ { ADMIN | INHERIT | SET } OPTION FOR ]
+     <replaceable class="parameter">role_name</replaceable> [, ...] FROM <replaceable class="parameter">role_specification</replaceable> [, ...]
++    [ IN DATABASE <replaceable class="parameter">database_name</replaceable> | IN CURRENT DATABASE ]
+     [ GRANTED BY <replaceable class="parameter">role_specification</replaceable> ]
+     [ CASCADE | RESTRICT ]
+ 
+@@ -316,6 +317,14 @@ REVOKE ALL PRIVILEGES ON kinds FROM manuel;
+ 
+ <programlisting>
+ REVOKE admins FROM joe;
++</programlisting></para>
++
++  <para>
++   Revoke write access for user <literal>bob</literal> from the <literal>sales</literal>
++   database:
++
++<programlisting>
++REVOKE pg_write_all_data FROM bob IN DATABASE sales;
+ </programlisting></para>
+  </refsect1>
+ 
+diff --git a/doc/src/sgml/user-manag.sgml b/doc/src/sgml/user-manag.sgml
+index ed18704a9c2..05cadbf2a41 100644
+--- a/doc/src/sgml/user-manag.sgml
++++ b/doc/src/sgml/user-manag.sgml
+@@ -391,6 +391,11 @@ CREATE ROLE <replaceable>name</replaceable>;
+ <synopsis>
+ GRANT <replaceable>group_role</replaceable> TO <replaceable>role1</replaceable>, ... ;
+ REVOKE <replaceable>group_role</replaceable> FROM <replaceable>role1</replaceable>, ... ;
++</synopsis>
++   Role membership can also be granted and revoked within the context of a specific database:
++<synopsis>
++GRANT <replaceable>group_role</replaceable> TO <replaceable>role1</replaceable>, ... IN CURRENT DATABASE;
++REVOKE <replaceable>group_role</replaceable> FROM <replaceable>role1</replaceable>, ... IN DATABASE <replaceable>database_name</replaceable>;
+ </synopsis>
+    You can grant membership to other group roles, too (since there isn't
+    really any distinction between group roles and non-group roles).  The
+@@ -598,6 +603,15 @@ GRANT pg_signal_backend TO admin_user;
+ </programlisting>
+   </para>
+ 
++  <para>
++   Access can also be granted within the context of a specific database,
++   for example:
++
++<programlisting>
++GRANT pg_read_all_data TO reporting_user IN DATABASE sales;
++</programlisting>
++  </para>
++
+   <warning>
+    <para>
+     Care should be taken when granting these roles to ensure they are only used
+diff --git a/src/backend/backup/basebackup_server.c b/src/backend/backup/basebackup_server.c
+index f5c0c61640a..ae0ed71ffca 100644
+--- a/src/backend/backup/basebackup_server.c
++++ b/src/backend/backup/basebackup_server.c
+@@ -67,7 +67,7 @@ bbsink_server_new(bbsink *next, char *pathname)
+ 
+ 	/* Replication permission is not sufficient in this case. */
+ 	StartTransactionCommand();
+-	if (!has_privs_of_role(GetUserId(), ROLE_PG_WRITE_SERVER_FILES))
++	if (!has_cluster_privs_of_role(GetUserId(), ROLE_PG_WRITE_SERVER_FILES))
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 				 errmsg("permission denied to create backup stored on server"),
+diff --git a/src/backend/catalog/aclchk.c b/src/backend/catalog/aclchk.c
+index 95eb0b12277..9112fbaddbd 100644
+--- a/src/backend/catalog/aclchk.c
++++ b/src/backend/catalog/aclchk.c
+@@ -1142,7 +1142,7 @@ ExecAlterDefaultPrivilegesStmt(ParseState *pstate, AlterDefaultPrivilegesStmt *s
+ 
+ 			iacls.roleid = get_rolespec_oid(rolespec, false);
+ 
+-			if (!has_privs_of_role(GetUserId(), iacls.roleid))
++			if (!has_privs_of_role(GetUserId(), iacls.roleid, MyDatabaseId))
+ 				ereport(ERROR,
+ 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 						 errmsg("permission denied to change default privileges")));
+@@ -3430,7 +3430,7 @@ pg_class_aclmask_ext(Oid table_oid, Oid roleid, AclMode mask,
+ 	 * pg_read_all_data role, which allows read access to all relations.
+ 	 */
+ 	if (mask & ACL_SELECT && !(result & ACL_SELECT) &&
+-		has_privs_of_role(roleid, ROLE_PG_READ_ALL_DATA))
++		has_privs_of_role(roleid, ROLE_PG_READ_ALL_DATA, MyDatabaseId))
+ 		result |= ACL_SELECT;
+ 
+ 	/*
+@@ -3442,7 +3442,7 @@ pg_class_aclmask_ext(Oid table_oid, Oid roleid, AclMode mask,
+ 	 */
+ 	if (mask & (ACL_INSERT | ACL_UPDATE | ACL_DELETE) &&
+ 		!(result & (ACL_INSERT | ACL_UPDATE | ACL_DELETE)) &&
+-		has_privs_of_role(roleid, ROLE_PG_WRITE_ALL_DATA))
++		has_privs_of_role(roleid, ROLE_PG_WRITE_ALL_DATA, MyDatabaseId))
+ 		result |= (mask & (ACL_INSERT | ACL_UPDATE | ACL_DELETE));
+ 
+ 	/*
+@@ -3453,7 +3453,7 @@ pg_class_aclmask_ext(Oid table_oid, Oid roleid, AclMode mask,
+ 	 */
+ 	if (mask & ACL_MAINTAIN &&
+ 		!(result & ACL_MAINTAIN) &&
+-		has_privs_of_role(roleid, ROLE_PG_MAINTAIN))
++		has_privs_of_role(roleid, ROLE_PG_MAINTAIN, MyDatabaseId))
+ 		result |= ACL_MAINTAIN;
+ 
+ 	return result;
+@@ -3752,8 +3752,8 @@ pg_namespace_aclmask_ext(Oid nsp_oid, Oid roleid,
+ 	 * to all schemas.
+ 	 */
+ 	if (mask & ACL_USAGE && !(result & ACL_USAGE) &&
+-		(has_privs_of_role(roleid, ROLE_PG_READ_ALL_DATA) ||
+-		 has_privs_of_role(roleid, ROLE_PG_WRITE_ALL_DATA)))
++		(has_privs_of_role(roleid, ROLE_PG_READ_ALL_DATA, MyDatabaseId) ||
++		 has_privs_of_role(roleid, ROLE_PG_WRITE_ALL_DATA, MyDatabaseId)))
+ 		result |= ACL_USAGE;
+ 	return result;
+ }
+@@ -4208,7 +4208,7 @@ object_ownercheck(Oid classid, Oid objectid, Oid roleid)
+ 		table_close(rel, AccessShareLock);
+ 	}
+ 
+-	return has_privs_of_role(roleid, ownerId);
++	return has_privs_of_role(roleid, ownerId, MyDatabaseId);
+ }
+ 
+ /*
+diff --git a/src/backend/catalog/catalog.c b/src/backend/catalog/catalog.c
+index cfe8c5104b6..fcedbe3a337 100644
+--- a/src/backend/catalog/catalog.c
++++ b/src/backend/catalog/catalog.c
+@@ -288,8 +288,8 @@ IsSharedRelation(Oid relationId)
+ 	/* These are their indexes */
+ 	if (relationId == AuthIdOidIndexId ||
+ 		relationId == AuthIdRolnameIndexId ||
+-		relationId == AuthMemMemRoleIndexId ||
+-		relationId == AuthMemRoleMemIndexId ||
++		relationId == AuthMemMemRoleDbIndexId ||
++		relationId == AuthMemRoleMemDbIndexId ||
+ 		relationId == AuthMemOidIndexId ||
+ 		relationId == AuthMemGrantorIndexId ||
+ 		relationId == DatabaseNameIndexId ||
+diff --git a/src/backend/catalog/namespace.c b/src/backend/catalog/namespace.c
+index 30807f91904..13525b88c66 100644
+--- a/src/backend/catalog/namespace.c
++++ b/src/backend/catalog/namespace.c
+@@ -4773,7 +4773,7 @@ InitializeSearchPath(void)
+ 									  (Datum) 0);
+ 
+ 		/* role membership may affect ACLs */
+-		CacheRegisterSyscacheCallback(AUTHMEMROLEMEM,
++		CacheRegisterSyscacheCallback(AUTHMEMROLEMEMDB,
+ 									  InvalidationCallback,
+ 									  (Datum) 0);
+ 
+diff --git a/src/backend/catalog/objectaddress.c b/src/backend/catalog/objectaddress.c
+index 85a7b7e641a..099d06c832d 100644
+--- a/src/backend/catalog/objectaddress.c
++++ b/src/backend/catalog/objectaddress.c
+@@ -2521,7 +2521,7 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
+ 							 errmsg("permission denied"),
+ 							 errdetail("The current user must have the %s attribute.",
+ 									   "CREATEROLE")));
+-				if (!is_admin_of_role(roleid, address.objectId))
++				if (!is_admin_of_role(roleid, address.objectId, InvalidOid))
+ 					ereport(ERROR,
+ 							(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 							 errmsg("permission denied"),
+diff --git a/src/backend/commands/alter.c b/src/backend/commands/alter.c
+index 4f99ebb4470..3de2a3be9d2 100644
+--- a/src/backend/commands/alter.c
++++ b/src/backend/commands/alter.c
+@@ -219,7 +219,7 @@ AlterObjectRename_internal(Relation rel, Oid objectId, const char *new_name)
+ 		Assert(!isnull);
+ 		ownerId = DatumGetObjectId(datum);
+ 
+-		if (!has_privs_of_role(GetUserId(), DatumGetObjectId(ownerId)))
++		if (!has_privs_of_role(GetUserId(), DatumGetObjectId(ownerId), MyDatabaseId))
+ 			aclcheck_error(ACLCHECK_NOT_OWNER, get_object_type(classId, objectId),
+ 						   old_name);
+ 
+@@ -739,7 +739,7 @@ AlterObjectNamespace_internal(Relation rel, Oid objid, Oid nspOid)
+ 		Assert(!isnull);
+ 		ownerId = DatumGetObjectId(owner);
+ 
+-		if (!has_privs_of_role(GetUserId(), ownerId))
++		if (!has_privs_of_role(GetUserId(), ownerId, MyDatabaseId))
+ 			aclcheck_error(ACLCHECK_NOT_OWNER, get_object_type(classId, objid),
+ 						   NameStr(*(DatumGetName(name))));
+ 
+@@ -961,7 +961,7 @@ AlterObjectOwner_internal(Oid classId, Oid objectId, Oid new_ownerId)
+ 		if (!superuser())
+ 		{
+ 			/* must be owner */
+-			if (!has_privs_of_role(GetUserId(), old_ownerId))
++			if (!has_privs_of_role(GetUserId(), old_ownerId, MyDatabaseId))
+ 			{
+ 				char	   *objname;
+ 				char		namebuf[NAMEDATALEN];
+diff --git a/src/backend/commands/copy.c b/src/backend/commands/copy.c
+index 03eb7a4ebac..5ae69286482 100644
+--- a/src/backend/commands/copy.c
++++ b/src/backend/commands/copy.c
+@@ -78,7 +78,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
+ 	{
+ 		if (stmt->is_program)
+ 		{
+-			if (!has_privs_of_role(GetUserId(), ROLE_PG_EXECUTE_SERVER_PROGRAM))
++			if (!has_cluster_privs_of_role(GetUserId(), ROLE_PG_EXECUTE_SERVER_PROGRAM))
+ 				ereport(ERROR,
+ 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 						 errmsg("permission denied to COPY to or from an external program"),
+@@ -89,7 +89,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
+ 		}
+ 		else
+ 		{
+-			if (is_from && !has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
++			if (is_from && !has_cluster_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
+ 				ereport(ERROR,
+ 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 						 errmsg("permission denied to COPY from a file"),
+@@ -98,7 +98,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
+ 						 errhint("Anyone can COPY to stdout or from stdin. "
+ 								 "psql's \\copy command also works for anyone.")));
+ 
+-			if (!is_from && !has_privs_of_role(GetUserId(), ROLE_PG_WRITE_SERVER_FILES))
++			if (!is_from && !has_cluster_privs_of_role(GetUserId(), ROLE_PG_WRITE_SERVER_FILES))
+ 				ereport(ERROR,
+ 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 						 errmsg("permission denied to COPY to a file"),
+diff --git a/src/backend/commands/dbcommands.c b/src/backend/commands/dbcommands.c
+index aa91a396967..73e88cf2b20 100644
+--- a/src/backend/commands/dbcommands.c
++++ b/src/backend/commands/dbcommands.c
+@@ -48,6 +48,7 @@
+ #include "commands/defrem.h"
+ #include "commands/seclabel.h"
+ #include "commands/tablespace.h"
++#include "commands/user.h"
+ #include "common/file_perm.h"
+ #include "mb/pg_wchar.h"
+ #include "miscadmin.h"
+@@ -1774,6 +1775,11 @@ dropdb(const char *dbname, bool missing_ok, bool force)
+ 	DeleteSharedComments(db_id, DatabaseRelationId);
+ 	DeleteSharedSecurityLabel(db_id, DatabaseRelationId);
+ 
++	/*
++	 * Delete any roles memberships directly associated with this database.
++	 */
++	DropDatabaseSpecificRoles(db_id);
++
+ 	/*
+ 	 * Remove settings associated with this database
+ 	 */
+diff --git a/src/backend/commands/indexcmds.c b/src/backend/commands/indexcmds.c
+index e33ad815295..da5e698dd68 100644
+--- a/src/backend/commands/indexcmds.c
++++ b/src/backend/commands/indexcmds.c
+@@ -3120,7 +3120,7 @@ ReindexMultipleTables(const ReindexStmt *stmt, const ReindexParams *params)
+ 		objectOid = get_namespace_oid(objectName, false);
+ 
+ 		if (!object_ownercheck(NamespaceRelationId, objectOid, GetUserId()) &&
+-			!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN))
++			!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN, MyDatabaseId))
+ 			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SCHEMA,
+ 						   objectName);
+ 	}
+@@ -3133,7 +3133,7 @@ ReindexMultipleTables(const ReindexStmt *stmt, const ReindexParams *params)
+ 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+ 					 errmsg("can only reindex the currently open database")));
+ 		if (!object_ownercheck(DatabaseRelationId, objectOid, GetUserId()) &&
+-			!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN))
++			!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN, MyDatabaseId))
+ 			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
+ 						   get_database_name(objectOid));
+ 	}
+diff --git a/src/backend/commands/subscriptioncmds.c b/src/backend/commands/subscriptioncmds.c
+index 02ccc636b80..670590470e2 100644
+--- a/src/backend/commands/subscriptioncmds.c
++++ b/src/backend/commands/subscriptioncmds.c
+@@ -611,7 +611,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
+ 	 * attempts to access arbitrary network destinations, so require the user
+ 	 * to have been specifically authorized to create subscriptions.
+ 	 */
+-	if (!has_privs_of_role(owner, ROLE_PG_CREATE_SUBSCRIPTION))
++	if (!has_privs_of_role(owner, ROLE_PG_CREATE_SUBSCRIPTION, MyDatabaseId))
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 				 errmsg("permission denied to create subscription"),
+diff --git a/src/backend/commands/user.c b/src/backend/commands/user.c
+index e7ade898a47..f56cc3eabaa 100644
+--- a/src/backend/commands/user.c
++++ b/src/backend/commands/user.c
+@@ -92,15 +92,15 @@ check_password_hook_type check_password_hook = NULL;
+ 
+ static void AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
+ 						List *memberSpecs, List *memberIds,
+-						Oid grantorId, GrantRoleOptions *popt);
++						Oid grantorId, GrantRoleOptions *popt, Oid db_id);
+ static void DelRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
+ 						List *memberSpecs, List *memberIds,
+ 						Oid grantorId, GrantRoleOptions *popt,
+-						DropBehavior behavior);
++						DropBehavior behavior, Oid db_id);
+ static void check_role_membership_authorization(Oid currentUserId, Oid roleid,
+-												bool is_grant);
++												bool is_grant, Oid db_id);
+ static Oid	check_role_grantor(Oid currentUserId, Oid roleid, Oid grantorId,
+-							   bool is_grant);
++							   bool is_grant, Oid db_id);
+ static RevokeRoleGrantAction *initialize_revoke_actions(CatCList *memlist);
+ static bool plan_single_revoke(CatCList *memlist,
+ 							   RevokeRoleGrantAction *actions,
+@@ -517,11 +517,12 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
+ 			char	   *oldrolename = NameStr(oldroleform->rolname);
+ 
+ 			/* can only add this role to roles for which you have rights */
+-			check_role_membership_authorization(currentUserId, oldroleid, true);
++			check_role_membership_authorization(currentUserId, oldroleid,
++												true, InvalidOid);
+ 			AddRoleMems(currentUserId, oldrolename, oldroleid,
+ 						thisrole_list,
+ 						thisrole_oidlist,
+-						InvalidOid, &popt);
++						InvalidOid, &popt, InvalidOid);
+ 
+ 			ReleaseSysCache(oldroletup);
+ 		}
+@@ -557,7 +558,7 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
+ 
+ 		AddRoleMems(BOOTSTRAP_SUPERUSERID, stmt->role, roleid,
+ 					memberSpecs, memberIds,
+-					BOOTSTRAP_SUPERUSERID, &poptself);
++					BOOTSTRAP_SUPERUSERID, &poptself, InvalidOid);
+ 
+ 		/*
+ 		 * We must make the implicit grant visible to the code below, else the
+@@ -577,7 +578,7 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
+ 		if (createrole_self_grant_enabled)
+ 			AddRoleMems(currentUserId, stmt->role, roleid,
+ 						memberSpecs, memberIds,
+-						currentUserId, &createrole_self_grant_options);
++						currentUserId, &createrole_self_grant_options, InvalidOid);
+ 	}
+ 
+ 	/*
+@@ -589,12 +590,12 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
+ 	 */
+ 	AddRoleMems(currentUserId, stmt->role, roleid,
+ 				rolemembers, roleSpecsToIds(rolemembers),
+-				InvalidOid, &popt);
++				InvalidOid, &popt, InvalidOid);
+ 	popt.specified |= GRANT_ROLE_SPECIFIED_ADMIN;
+ 	popt.admin = true;
+ 	AddRoleMems(currentUserId, stmt->role, roleid,
+ 				adminmembers, roleSpecsToIds(adminmembers),
+-				InvalidOid, &popt);
++				InvalidOid, &popt, InvalidOid);
+ 
+ 	/* Post creation hook for new role */
+ 	InvokeObjectPostCreateHook(AuthIdRelationId, roleid, 0);
+@@ -771,7 +772,7 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
+ 	 * and also ADMIN OPTION on the role.
+ 	 */
+ 	if (!have_createrole_privilege() ||
+-		!is_admin_of_role(GetUserId(), roleid))
++		!is_admin_of_role(GetUserId(), roleid, InvalidOid))
+ 	{
+ 		/* things an unprivileged user certainly can't do */
+ 		if (dinherit || dcreaterole || dcreatedb || dcanlogin || dconnlimit ||
+@@ -818,7 +819,7 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
+ 	}
+ 
+ 	/* To add members to a role, you need ADMIN OPTION. */
+-	if (drolemembers && !is_admin_of_role(currentUserId, roleid))
++	if (drolemembers && !is_admin_of_role(currentUserId, roleid, InvalidOid))
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 				 errmsg("permission denied to alter role"),
+@@ -977,11 +978,11 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
+ 		if (stmt->action == +1) /* add members to role */
+ 			AddRoleMems(currentUserId, rolename, roleid,
+ 						rolemembers, roleSpecsToIds(rolemembers),
+-						InvalidOid, &popt);
++						InvalidOid, &popt, InvalidOid);
+ 		else if (stmt->action == -1)	/* drop members from role */
+ 			DelRoleMems(currentUserId, rolename, roleid,
+ 						rolemembers, roleSpecsToIds(rolemembers),
+-						InvalidOid, &popt, DROP_RESTRICT);
++						InvalidOid, &popt, DROP_RESTRICT, InvalidOid);
+ 	}
+ 
+ 	/*
+@@ -1036,7 +1037,7 @@ AlterRoleSet(AlterRoleSetStmt *stmt)
+ 		else
+ 		{
+ 			if ((!have_createrole_privilege() ||
+-				 !is_admin_of_role(GetUserId(), roleid))
++				 !is_admin_of_role(GetUserId(), roleid, InvalidOid))
+ 				&& roleid != GetUserId())
+ 				ereport(ERROR,
+ 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+@@ -1171,7 +1172,7 @@ DropRole(DropRoleStmt *stmt)
+ 					 errmsg("permission denied to drop role"),
+ 					 errdetail("Only roles with the %s attribute may drop roles with the %s attribute.",
+ 							   "SUPERUSER", "SUPERUSER")));
+-		if (!is_admin_of_role(GetUserId(), roleid))
++		if (!is_admin_of_role(GetUserId(), roleid, InvalidOid))
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 					 errmsg("permission denied to drop role"),
+@@ -1212,7 +1213,7 @@ DropRole(DropRoleStmt *stmt)
+ 					BTEqualStrategyNumber, F_OIDEQ,
+ 					ObjectIdGetDatum(roleid));
+ 
+-		sscan = systable_beginscan(pg_auth_members_rel, AuthMemRoleMemIndexId,
++		sscan = systable_beginscan(pg_auth_members_rel, AuthMemRoleMemDbIndexId,
+ 								   true, NULL, 1, &scankey);
+ 
+ 		while (HeapTupleIsValid(tmp_tuple = systable_getnext(sscan)))
+@@ -1232,7 +1233,7 @@ DropRole(DropRoleStmt *stmt)
+ 					BTEqualStrategyNumber, F_OIDEQ,
+ 					ObjectIdGetDatum(roleid));
+ 
+-		sscan = systable_beginscan(pg_auth_members_rel, AuthMemMemRoleIndexId,
++		sscan = systable_beginscan(pg_auth_members_rel, AuthMemMemRoleDbIndexId,
+ 								   true, NULL, 1, &scankey);
+ 
+ 		while (HeapTupleIsValid(tmp_tuple = systable_getnext(sscan)))
+@@ -1425,7 +1426,7 @@ RenameRole(const char *oldname, const char *newname)
+ 	else
+ 	{
+ 		if (!have_createrole_privilege() ||
+-			!is_admin_of_role(GetUserId(), roleid))
++			!is_admin_of_role(GetUserId(), roleid, InvalidOid))
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 					 errmsg("permission denied to rename role"),
+@@ -1485,6 +1486,7 @@ GrantRole(ParseState *pstate, GrantRoleStmt *stmt)
+ 	ListCell   *item;
+ 	GrantRoleOptions popt;
+ 	Oid			currentUserId = GetUserId();
++	Oid			dbid;
+ 
+ 	/* Parse options list. */
+ 	InitGrantRoleOptions(&popt);
+@@ -1533,6 +1535,14 @@ GrantRole(ParseState *pstate, GrantRoleStmt *stmt)
+ 
+ 	grantee_ids = roleSpecsToIds(stmt->grantee_roles);
+ 
++	/* Lookup OID of database, if specified. */
++	if (stmt->database == NULL)
++		dbid = InvalidOid;
++	else if (strcmp(stmt->database, "") == 0)
++		dbid = MyDatabaseId;
++	else
++		dbid = get_database_oid(stmt->database, false);
++
+ 	/* AccessShareLock is enough since we aren't modifying pg_authid */
+ 	pg_authid_rel = table_open(AuthIdRelationId, AccessShareLock);
+ 
+@@ -1557,15 +1567,15 @@ GrantRole(ParseState *pstate, GrantRoleStmt *stmt)
+ 
+ 		roleid = get_role_oid(rolename, false);
+ 		check_role_membership_authorization(currentUserId,
+-											roleid, stmt->is_grant);
++											roleid, stmt->is_grant, dbid);
+ 		if (stmt->is_grant)
+ 			AddRoleMems(currentUserId, rolename, roleid,
+ 						stmt->grantee_roles, grantee_ids,
+-						grantor, &popt);
++						grantor, &popt, dbid);
+ 		else
+ 			DelRoleMems(currentUserId, rolename, roleid,
+ 						stmt->grantee_roles, grantee_ids,
+-						grantor, &popt, stmt->behavior);
++						grantor, &popt, stmt->behavior, dbid);
+ 	}
+ 
+ 	/*
+@@ -1590,7 +1600,7 @@ DropOwnedObjects(DropOwnedStmt *stmt)
+ 	{
+ 		Oid			roleid = lfirst_oid(cell);
+ 
+-		if (!has_privs_of_role(GetUserId(), roleid))
++		if (!has_privs_of_role(GetUserId(), roleid, MyDatabaseId))
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 					 errmsg("permission denied to drop objects"),
+@@ -1619,7 +1629,7 @@ ReassignOwnedObjects(ReassignOwnedStmt *stmt)
+ 	{
+ 		Oid			roleid = lfirst_oid(cell);
+ 
+-		if (!has_privs_of_role(GetUserId(), roleid))
++		if (!has_privs_of_role(GetUserId(), roleid, MyDatabaseId))
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 					 errmsg("permission denied to reassign objects"),
+@@ -1630,7 +1640,7 @@ ReassignOwnedObjects(ReassignOwnedStmt *stmt)
+ 	/* Must have privileges on the receiving side too */
+ 	newrole = get_rolespec_oid(stmt->newrole, false);
+ 
+-	if (!has_privs_of_role(GetUserId(), newrole))
++	if (!has_privs_of_role(GetUserId(), newrole, MyDatabaseId))
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 				 errmsg("permission denied to reassign objects"),
+@@ -1676,11 +1686,12 @@ roleSpecsToIds(List *memberNames)
+  * grantorId: OID that should be recorded as having granted the membership
+  * (InvalidOid if not set explicitly)
+  * popt: information about grant options
++ * db_id: OID of the database in which membership should be granted
+  */
+ static void
+ AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
+ 			List *memberSpecs, List *memberIds,
+-			Oid grantorId, GrantRoleOptions *popt)
++			Oid grantorId, GrantRoleOptions *popt, Oid db_id)
+ {
+ 	Relation	pg_authmem_rel;
+ 	TupleDesc	pg_authmem_dsc;
+@@ -1690,7 +1701,7 @@ AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
+ 	Assert(list_length(memberSpecs) == list_length(memberIds));
+ 
+ 	/* Validate grantor (and resolve implicit grantor if not specified). */
+-	grantorId = check_role_grantor(currentUserId, roleid, grantorId, true);
++	grantorId = check_role_grantor(currentUserId, roleid, grantorId, true, db_id);
+ 
+ 	pg_authmem_rel = table_open(AuthMemRelationId, RowExclusiveLock);
+ 	pg_authmem_dsc = RelationGetDescr(pg_authmem_rel);
+@@ -1769,7 +1780,7 @@ AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
+ 		int			i;
+ 
+ 		/* Get the list of members for this role. */
+-		memlist = SearchSysCacheList1(AUTHMEMROLEMEM,
++		memlist = SearchSysCacheList1(AUTHMEMROLEMEMDB,
+ 									  ObjectIdGetDatum(roleid));
+ 
+ 		/*
+@@ -1834,12 +1845,15 @@ AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
+ 			ObjectIdGetDatum(memberid);
+ 		new_record[Anum_pg_auth_members_grantor - 1] =
+ 			ObjectIdGetDatum(grantorId);
++		new_record[Anum_pg_auth_members_dbid - 1] =
++			ObjectIdGetDatum(db_id);
+ 
+ 		/* Find any existing tuple */
+-		authmem_tuple = SearchSysCache3(AUTHMEMROLEMEM,
++		authmem_tuple = SearchSysCache4(AUTHMEMROLEMEMDB,
+ 										ObjectIdGetDatum(roleid),
+ 										ObjectIdGetDatum(memberid),
+-										ObjectIdGetDatum(grantorId));
++										ObjectIdGetDatum(grantorId),
++										ObjectIdGetDatum(db_id));
+ 
+ 		/*
+ 		 * If we found a tuple, update it with new option values, unless there
+@@ -1886,10 +1900,16 @@ AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
+ 
+ 			if (!at_least_one_change)
+ 			{
+-				ereport(NOTICE,
+-						(errmsg("role \"%s\" has already been granted membership in role \"%s\" by role \"%s\"",
+-								get_rolespec_name(memberRole), rolename,
+-								GetUserNameFromId(grantorId, false))));
++				if (OidIsValid(db_id))
++					ereport(NOTICE,
++							(errmsg("role \"%s\" has already been granted membership in role \"%s\" in database \"%s\" by role \"%s\"",
++									get_rolespec_name(memberRole), rolename, get_database_name(db_id),
++									GetUserNameFromId(grantorId, false))));
++				else
++					ereport(NOTICE,
++							(errmsg("role \"%s\" has already been granted membership in role \"%s\" by role \"%s\"",
++									get_rolespec_name(memberRole), rolename,
++									GetUserNameFromId(grantorId, false))));
+ 				ReleaseSysCache(authmem_tuple);
+ 				continue;
+ 			}
+@@ -1974,11 +1994,12 @@ AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
+  * grantorId: who is revoking the membership
+  * popt: information about grant options
+  * behavior: RESTRICT or CASCADE behavior for recursive removal
++ * db_id: OID of the database in which membership should be removed
+  */
+ static void
+ DelRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
+ 			List *memberSpecs, List *memberIds,
+-			Oid grantorId, GrantRoleOptions *popt, DropBehavior behavior)
++			Oid grantorId, GrantRoleOptions *popt, DropBehavior behavior, Oid db_id)
+ {
+ 	Relation	pg_authmem_rel;
+ 	TupleDesc	pg_authmem_dsc;
+@@ -1991,7 +2012,7 @@ DelRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
+ 	Assert(list_length(memberSpecs) == list_length(memberIds));
+ 
+ 	/* Validate grantor (and resolve implicit grantor if not specified). */
+-	grantorId = check_role_grantor(currentUserId, roleid, grantorId, false);
++	grantorId = check_role_grantor(currentUserId, roleid, grantorId, false, db_id);
+ 
+ 	pg_authmem_rel = table_open(AuthMemRelationId, RowExclusiveLock);
+ 	pg_authmem_dsc = RelationGetDescr(pg_authmem_rel);
+@@ -2004,7 +2025,7 @@ DelRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
+ 	LockSharedObject(AuthIdRelationId, roleid, 0,
+ 					 ShareUpdateExclusiveLock);
+ 
+-	memlist = SearchSysCacheList1(AUTHMEMROLEMEM, ObjectIdGetDatum(roleid));
++	memlist = SearchSysCacheList1(AUTHMEMROLEMEMDB, ObjectIdGetDatum(roleid));
+ 	actions = initialize_revoke_actions(memlist);
+ 
+ 	/*
+@@ -2109,7 +2130,7 @@ DelRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
+  */
+ static void
+ check_role_membership_authorization(Oid currentUserId, Oid roleid,
+-									bool is_grant)
++									bool is_grant, Oid dbid)
+ {
+ 	/*
+ 	 * The charter of pg_database_owner is to have exactly one, implicit,
+@@ -2152,7 +2173,7 @@ check_role_membership_authorization(Oid currentUserId, Oid roleid,
+ 		/*
+ 		 * Otherwise, must have admin option on the role to be changed.
+ 		 */
+-		if (!is_admin_of_role(currentUserId, roleid))
++		if (!is_admin_of_role(currentUserId, roleid, dbid))
+ 		{
+ 			if (is_grant)
+ 				ereport(ERROR,
+@@ -2202,7 +2223,7 @@ check_role_membership_authorization(Oid currentUserId, Oid roleid,
+  * the operation.
+  */
+ static Oid
+-check_role_grantor(Oid currentUserId, Oid roleid, Oid grantorId, bool is_grant)
++check_role_grantor(Oid currentUserId, Oid roleid, Oid grantorId, bool is_grant, Oid db_id)
+ {
+ 	/* If the grantor ID was not specified, pick one to use. */
+ 	if (!OidIsValid(grantorId))
+@@ -2226,7 +2247,7 @@ check_role_grantor(Oid currentUserId, Oid roleid, Oid grantorId, bool is_grant)
+ 		 * established that the current user has permission to perform the
+ 		 * operation.)
+ 		 */
+-		grantorId = select_best_admin(currentUserId, roleid);
++		grantorId = select_best_admin(currentUserId, roleid, db_id);
+ 		if (!OidIsValid(grantorId))
+ 			elog(ERROR, "no possible grantors");
+ 		return grantorId;
+@@ -2243,7 +2264,7 @@ check_role_grantor(Oid currentUserId, Oid roleid, Oid grantorId, bool is_grant)
+ 	 */
+ 	if (is_grant)
+ 	{
+-		if (!has_privs_of_role(currentUserId, grantorId))
++		if (!has_privs_of_role(currentUserId, grantorId, db_id))
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 					 errmsg("permission denied to grant privileges as role \"%s\"",
+@@ -2252,7 +2273,7 @@ check_role_grantor(Oid currentUserId, Oid roleid, Oid grantorId, bool is_grant)
+ 							   GetUserNameFromId(grantorId, false))));
+ 
+ 		if (grantorId != BOOTSTRAP_SUPERUSERID &&
+-			select_best_admin(grantorId, roleid) != grantorId)
++			select_best_admin(grantorId, roleid, db_id) != grantorId)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 					 errmsg("permission denied to grant privileges as role \"%s\"",
+@@ -2262,7 +2283,7 @@ check_role_grantor(Oid currentUserId, Oid roleid, Oid grantorId, bool is_grant)
+ 	}
+ 	else
+ 	{
+-		if (!has_privs_of_role(currentUserId, grantorId))
++		if (!has_privs_of_role(currentUserId, grantorId, db_id))
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 					 errmsg("permission denied to revoke privileges granted by role \"%s\"",
+@@ -2579,3 +2600,42 @@ assign_createrole_self_grant(const char *newval, void *extra)
+ 	createrole_self_grant_options.set =
+ 		(options & GRANT_ROLE_SPECIFIED_SET) != 0;
+ }
++
++/*
++ * DropDatabaseSpecificRoles
++ *
++ * Delete pg_auth_members entries corresponding to a database that's being
++ * dropped.
++ */
++void
++DropDatabaseSpecificRoles(Oid databaseId)
++{
++	Relation	pg_authmem_rel;
++	ScanKeyData scankey;
++	SysScanDesc sscan;
++	HeapTuple	tup;
++
++	pg_authmem_rel = table_open(AuthMemRelationId, RowExclusiveLock);
++
++	ScanKeyInit(&scankey,
++				Anum_pg_auth_members_dbid,
++				BTEqualStrategyNumber, F_OIDEQ,
++				ObjectIdGetDatum(databaseId));
++
++	sscan = systable_beginscan(pg_authmem_rel, AuthMemMemRoleDbIndexId,
++							   true, NULL, 1, &scankey);
++
++	while (HeapTupleIsValid(tup = systable_getnext(sscan)))
++	{
++		Form_pg_auth_members authmem_form;
++
++		authmem_form = (Form_pg_auth_members) GETSTRUCT(tup);
++		deleteSharedDependencyRecordsFor(AuthMemRelationId,
++										 authmem_form->oid, 0);
++		CatalogTupleDelete(pg_authmem_rel, &tup->t_self);
++	}
++
++	systable_endscan(sscan);
++
++	table_close(pg_authmem_rel, RowExclusiveLock);
++}
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 4aa8646af7b..8e0ad919510 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -367,7 +367,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 
+ %type <str>		opt_type
+ %type <str>		foreign_server_version opt_foreign_server_version
+-%type <str>		opt_in_database
++%type <str>		opt_in_database opt_grant_in_database
+ 
+ %type <str>		parameter_name
+ %type <list>	OptSchemaEltList parameter_name_list
+@@ -7930,6 +7930,11 @@ grantee:
+ 		;
+ 
+ 
++opt_grant_in_database:
++			IN_P CURRENT_P DATABASE { $$ = ""; }
++			| opt_in_database { $$ = $1; }
++		;
++
+ opt_grant_grant_option:
+ 			WITH GRANT OPTION { $$ = true; }
+ 			| /*EMPTY*/ { $$ = false; }
+@@ -7942,32 +7947,34 @@ opt_grant_grant_option:
+  *****************************************************************************/
+ 
+ GrantRoleStmt:
+-			GRANT privilege_list TO role_list opt_granted_by
++			GRANT privilege_list TO role_list opt_grant_in_database opt_granted_by
+ 				{
+ 					GrantRoleStmt *n = makeNode(GrantRoleStmt);
+ 
+ 					n->is_grant = true;
+ 					n->granted_roles = $2;
+ 					n->grantee_roles = $4;
++					n->database = $5;
+ 					n->opt = NIL;
+-					n->grantor = $5;
++					n->grantor = $6;
+ 					$$ = (Node *) n;
+ 				}
+-		  | GRANT privilege_list TO role_list WITH grant_role_opt_list opt_granted_by
++		  | GRANT privilege_list TO role_list opt_grant_in_database WITH grant_role_opt_list opt_granted_by
+ 				{
+ 					GrantRoleStmt *n = makeNode(GrantRoleStmt);
+ 
+ 					n->is_grant = true;
+ 					n->granted_roles = $2;
+ 					n->grantee_roles = $4;
+-					n->opt = $6;
+-					n->grantor = $7;
++					n->database = $5;
++					n->opt = $7;
++					n->grantor = $8;
+ 					$$ = (Node *) n;
+ 				}
+ 		;
+ 
+ RevokeRoleStmt:
+-			REVOKE privilege_list FROM role_list opt_granted_by opt_drop_behavior
++			REVOKE privilege_list FROM role_list opt_grant_in_database opt_granted_by opt_drop_behavior
+ 				{
+ 					GrantRoleStmt *n = makeNode(GrantRoleStmt);
+ 
+@@ -7975,11 +7982,12 @@ RevokeRoleStmt:
+ 					n->opt = NIL;
+ 					n->granted_roles = $2;
+ 					n->grantee_roles = $4;
+-					n->grantor = $5;
+-					n->behavior = $6;
++					n->database = $5;
++					n->grantor = $6;
++					n->behavior = $7;
+ 					$$ = (Node *) n;
+ 				}
+-			| REVOKE ColId OPTION FOR privilege_list FROM role_list opt_granted_by opt_drop_behavior
++			| REVOKE ColId OPTION FOR privilege_list FROM role_list opt_grant_in_database opt_granted_by opt_drop_behavior
+ 				{
+ 					GrantRoleStmt *n = makeNode(GrantRoleStmt);
+ 					DefElem *opt;
+@@ -7990,8 +7998,9 @@ RevokeRoleStmt:
+ 					n->opt = list_make1(opt);
+ 					n->granted_roles = $5;
+ 					n->grantee_roles = $7;
+-					n->grantor = $8;
+-					n->behavior = $9;
++					n->database = $8;
++					n->grantor = $9;
++					n->behavior = $10;
+ 					$$ = (Node *) n;
+ 				}
+ 		;
+diff --git a/src/backend/replication/walreceiver.c b/src/backend/replication/walreceiver.c
+index a27aee63def..4f3afe069ca 100644
+--- a/src/backend/replication/walreceiver.c
++++ b/src/backend/replication/walreceiver.c
+@@ -1465,7 +1465,7 @@ pg_stat_get_wal_receiver(PG_FUNCTION_ARGS)
+ 	/* Fetch values */
+ 	values[0] = Int32GetDatum(pid);
+ 
+-	if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
++	if (!has_cluster_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
+ 	{
+ 		/*
+ 		 * Only superusers and roles with privileges of pg_read_all_stats can
+diff --git a/src/backend/replication/walsender.c b/src/backend/replication/walsender.c
+index 866b69ec855..4f6327c7518 100644
+--- a/src/backend/replication/walsender.c
++++ b/src/backend/replication/walsender.c
+@@ -3933,7 +3933,7 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
+ 
+ 		values[0] = Int32GetDatum(pid);
+ 
+-		if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
++		if (!has_cluster_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
+ 		{
+ 			/*
+ 			 * Only superusers and roles with privileges of pg_read_all_stats
+diff --git a/src/backend/rewrite/rowsecurity.c b/src/backend/rewrite/rowsecurity.c
+index 59fd305dd7b..84cace07f94 100644
+--- a/src/backend/rewrite/rowsecurity.c
++++ b/src/backend/rewrite/rowsecurity.c
+@@ -924,7 +924,7 @@ check_role_for_policy(ArrayType *policy_roles, Oid user_id)
+ 
+ 	for (i = 0; i < ARR_DIMS(policy_roles)[0]; i++)
+ 	{
+-		if (has_privs_of_role(user_id, roles[i]))
++		if (has_privs_of_role(user_id, roles[i], MyDatabaseId))
+ 			return true;
+ 	}
+ 
+diff --git a/src/backend/storage/ipc/procarray.c b/src/backend/storage/ipc/procarray.c
+index 36610a1c7e7..77558d4c88e 100644
+--- a/src/backend/storage/ipc/procarray.c
++++ b/src/backend/storage/ipc/procarray.c
+@@ -3899,8 +3899,8 @@ TerminateOtherDBBackends(Oid databaseId)
+ 							 errdetail("Only roles with the %s attribute may terminate processes of roles with the %s attribute.",
+ 									   "SUPERUSER", "SUPERUSER")));
+ 
+-				if (!has_privs_of_role(GetUserId(), proc->roleId) &&
+-					!has_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_BACKEND))
++				if (!has_privs_of_role(GetUserId(), proc->roleId, databaseId) &&
++					!has_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_BACKEND, databaseId))
+ 					ereport(ERROR,
+ 							(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 							 errmsg("permission denied to terminate process"),
+diff --git a/src/backend/storage/ipc/signalfuncs.c b/src/backend/storage/ipc/signalfuncs.c
+index aa729a36e39..50e6ed3a500 100644
+--- a/src/backend/storage/ipc/signalfuncs.c
++++ b/src/backend/storage/ipc/signalfuncs.c
+@@ -92,14 +92,14 @@ pg_signal_backend(int pid, int sig)
+ 
+ 		if (procStatus && procStatus->st_backendType == B_AUTOVAC_WORKER)
+ 		{
+-			if (!has_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_AUTOVACUUM_WORKER))
++			if (!has_cluster_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_AUTOVACUUM_WORKER))
+ 				return SIGNAL_BACKEND_NOAUTOVAC;
+ 		}
+ 		else if (!superuser())
+ 			return SIGNAL_BACKEND_NOSUPERUSER;
+ 	}
+-	else if (!has_privs_of_role(GetUserId(), proc->roleId) &&
+-			 !has_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_BACKEND))
++	else if (!has_cluster_privs_of_role(GetUserId(), proc->roleId) &&
++			 !has_cluster_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_BACKEND))
+ 		return SIGNAL_BACKEND_NOPERMISSION;
+ 
+ 	/*
+diff --git a/src/backend/tcop/utility.c b/src/backend/tcop/utility.c
+index b2ea8125c92..900ccc292d1 100644
+--- a/src/backend/tcop/utility.c
++++ b/src/backend/tcop/utility.c
+@@ -940,7 +940,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
+ 			break;
+ 
+ 		case T_CheckPointStmt:
+-			if (!has_privs_of_role(GetUserId(), ROLE_PG_CHECKPOINT))
++			if (!has_cluster_privs_of_role(GetUserId(), ROLE_PG_CHECKPOINT))
+ 				ereport(ERROR,
+ 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+ 				/* translator: %s is name of a SQL command, eg CHECKPOINT */
+diff --git a/src/backend/utils/adt/acl.c b/src/backend/utils/adt/acl.c
+index 2a716cc6b7f..d2f186da249 100644
+--- a/src/backend/utils/adt/acl.c
++++ b/src/backend/utils/adt/acl.c
+@@ -1395,7 +1395,7 @@ aclmask(const Acl *acl, Oid roleid, Oid ownerId,
+ 
+ 	/* Owner always implicitly has all grant options */
+ 	if ((mask & ACLITEM_ALL_GOPTION_BITS) &&
+-		has_privs_of_role(roleid, ownerId))
++		has_privs_of_role(roleid, ownerId, MyDatabaseId))
+ 	{
+ 		result = mask & ACLITEM_ALL_GOPTION_BITS;
+ 		if ((how == ACLMASK_ALL) ? (result == mask) : (result != 0))
+@@ -1438,7 +1438,7 @@ aclmask(const Acl *acl, Oid roleid, Oid ownerId,
+ 			continue;			/* already checked it */
+ 
+ 		if ((aidata->ai_privs & remaining) &&
+-			has_privs_of_role(roleid, aidata->ai_grantee))
++			has_privs_of_role(roleid, aidata->ai_grantee, MyDatabaseId))
+ 		{
+ 			result |= aidata->ai_privs & mask;
+ 			if ((how == ACLMASK_ALL) ? (result == mask) : (result != 0))
+@@ -4995,7 +4995,7 @@ pg_role_aclcheck(Oid role_oid, Oid roleid, AclMode mode)
+ {
+ 	if (mode & ACL_GRANT_OPTION_FOR(ACL_CREATE))
+ 	{
+-		if (is_admin_of_role(roleid, role_oid))
++		if (is_admin_of_role(roleid, role_oid, MyDatabaseId))
+ 			return ACLCHECK_OK;
+ 	}
+ 	if (mode & ACL_CREATE)
+@@ -5005,7 +5005,7 @@ pg_role_aclcheck(Oid role_oid, Oid roleid, AclMode mode)
+ 	}
+ 	if (mode & ACL_USAGE)
+ 	{
+-		if (has_privs_of_role(roleid, role_oid))
++		if (has_privs_of_role(roleid, role_oid, MyDatabaseId))
+ 			return ACLCHECK_OK;
+ 	}
+ 	if (mode & ACL_SET)
+@@ -5034,7 +5034,7 @@ initialize_acl(void)
+ 		 * of pg_auth_members (for roles_is_member_of()) pg_database (for
+ 		 * roles_is_member_of())
+ 		 */
+-		CacheRegisterSyscacheCallback(AUTHMEMROLEMEM,
++		CacheRegisterSyscacheCallback(AUTHMEMROLEMEMDB,
+ 									  RoleMembershipCacheCallback,
+ 									  (Datum) 0);
+ 		CacheRegisterSyscacheCallback(AUTHOID,
+@@ -5114,7 +5114,62 @@ roles_list_append(List *roles_list, bloom_filter **bf, Oid role)
+ }
+ 
+ /*
+- * Get a list of roles that the specified roleid is a member of
++ * Append role memberships to the list of roles
++ */
++static void
++append_role_memberships(List *roles_list, enum RoleRecurseType type,
++						Oid admin_of, Oid *admin_role, Oid memberid,
++						Oid databaseId, bloom_filter *bf)
++{
++	CatCList   *memlist;
++	int			i;
++	Oid			targetDatabaseId;
++
++	if (!OidIsValid(databaseId))
++		targetDatabaseId = InvalidOid;
++	else
++		targetDatabaseId = MyDatabaseId;
++
++	memlist = SearchSysCacheList2(AUTHMEMMEMDBROLE,
++								  ObjectIdGetDatum(memberid),
++								  ObjectIdGetDatum(targetDatabaseId));
++	for (i = 0; i < memlist->n_members; i++)
++	{
++		HeapTuple	tup = &memlist->members[i]->tuple;
++		Form_pg_auth_members form = (Form_pg_auth_members) GETSTRUCT(tup);
++		Oid			otherid = form->roleid;
++		Oid			db_id = form->dbid;
++
++		/*
++		 * While otherid==InvalidOid shouldn't appear in the catalog, the
++		 * OidIsValid() avoids crashing if that arises.
++		 */
++		if (otherid == admin_of && form->admin_option &&
++			db_id == databaseId &&
++			OidIsValid(admin_of) && !OidIsValid(*admin_role))
++			*admin_role = memberid;
++
++		/* If we're supposed to ignore non-heritable grants, do so. */
++		if (type == ROLERECURSE_PRIVS && db_id == databaseId && !form->inherit_option)
++			continue;
++
++		/* If we're supposed to ignore non-SET grants, do so. */
++		if (type == ROLERECURSE_SETROLE && db_id == databaseId && !form->set_option)
++			continue;
++
++		/*
++		 * Even though there shouldn't be any loops in the membership graph,
++		 * we must test for having already seen this role. It is legal for
++		 * instance to have both A->B and A->C->B.
++		 */
++		roles_list = roles_list_append(roles_list, &bf, otherid);
++	}
++	ReleaseSysCacheList(memlist);
++}
++
++/*
++ * Get a list of roles that the specified roleid is a member of, possibly
++ * scoped to specified database with databaseId.
+  *
+  * Type ROLERECURSE_MEMBERS recurses through all grants; ROLERECURSE_PRIVS
+  * recurses only through inheritable grants; and ROLERECURSE_SETROLE recurses
+@@ -5134,7 +5189,7 @@ roles_list_append(List *roles_list, bloom_filter **bf, Oid role)
+  */
+ static List *
+ roles_is_member_of(Oid roleid, enum RoleRecurseType type,
+-				   Oid admin_of, Oid *admin_role)
++				   Oid admin_of, Oid *admin_role, Oid databaseId)
+ {
+ 	Oid			dba;
+ 	List	   *roles_list;
+@@ -5157,7 +5212,7 @@ roles_is_member_of(Oid roleid, enum RoleRecurseType type,
+ 	 * ROLE_PG_READ_ALL_SETTINGS for a physical walsender SHOW command.  In
+ 	 * that case, no role gets pg_database_owner.
+ 	 */
+-	if (!OidIsValid(MyDatabaseId))
++	if (!OidIsValid(MyDatabaseId))	/* XXX or databaseId? */
+ 		dba = InvalidOid;
+ 	else
+ 	{
+@@ -5186,42 +5241,18 @@ roles_is_member_of(Oid roleid, enum RoleRecurseType type,
+ 	foreach(l, roles_list)
+ 	{
+ 		Oid			memberid = lfirst_oid(l);
+-		CatCList   *memlist;
+-		int			i;
+ 
+ 		/* Find roles that memberid is directly a member of */
+-		memlist = SearchSysCacheList1(AUTHMEMMEMROLE,
+-									  ObjectIdGetDatum(memberid));
+-		for (i = 0; i < memlist->n_members; i++)
+-		{
+-			HeapTuple	tup = &memlist->members[i]->tuple;
+-			Form_pg_auth_members form = (Form_pg_auth_members) GETSTRUCT(tup);
+-			Oid			otherid = form->roleid;
+-
+-			/*
+-			 * While otherid==InvalidOid shouldn't appear in the catalog, the
+-			 * OidIsValid() avoids crashing if that arises.
+-			 */
+-			if (otherid == admin_of && form->admin_option &&
+-				OidIsValid(admin_of) && !OidIsValid(*admin_role))
+-				*admin_role = memberid;
+-
+-			/* If we're supposed to ignore non-heritable grants, do so. */
+-			if (type == ROLERECURSE_PRIVS && !form->inherit_option)
+-				continue;
++		append_role_memberships(roles_list, type, admin_of, admin_role,
++								memberid, InvalidOid, bf);
+ 
+-			/* If we're supposed to ignore non-SET grants, do so. */
+-			if (type == ROLERECURSE_SETROLE && !form->set_option)
+-				continue;
+-
+-			/*
+-			 * Even though there shouldn't be any loops in the membership
+-			 * graph, we must test for having already seen this role. It is
+-			 * legal for instance to have both A->B and A->C->B.
+-			 */
+-			roles_list = roles_list_append(roles_list, &bf, otherid);
+-		}
+-		ReleaseSysCacheList(memlist);
++		/*
++		 * Find roles that memberid is directly a member of in the current
++		 * database
++		 */
++		if (OidIsValid(databaseId))
++			append_role_memberships(roles_list, type, admin_of, admin_role,
++									memberid, databaseId, bf);
+ 
+ 		/* implement pg_database_owner implicit membership */
+ 		if (memberid == dba && OidIsValid(dba))
+@@ -5257,7 +5288,8 @@ roles_is_member_of(Oid roleid, enum RoleRecurseType type,
+ 
+ 
+ /*
+- * Does member have the privileges of role (directly or indirectly)?
++ * Does member have the privileges of role (directly or indirectly) in
++ * specified database or cluster-wise?
+  *
+  * This is defined not to recurse through grants that are not inherited,
+  * and only inherited grants confer the associated privileges automatically.
+@@ -5265,7 +5297,7 @@ roles_is_member_of(Oid roleid, enum RoleRecurseType type,
+  * See also member_can_set_role, below.
+  */
+ bool
+-has_privs_of_role(Oid member, Oid role)
++has_privs_of_role(Oid member, Oid role, Oid database)
+ {
+ 	/* Fast path for simple case */
+ 	if (member == role)
+@@ -5280,10 +5312,21 @@ has_privs_of_role(Oid member, Oid role)
+ 	 * multi-level recursion, then see if target role is any one of them.
+ 	 */
+ 	return list_member_oid(roles_is_member_of(member, ROLERECURSE_PRIVS,
+-											  InvalidOid, NULL),
++											  InvalidOid, NULL, database),
+ 						   role);
+ }
+ 
++
++/*
++ * Does member have the privileges of role *cluster-wide*?
++ *
++ */
++bool
++has_cluster_privs_of_role(Oid member, Oid role)
++{
++	return has_privs_of_role(member, role, InvalidOid);
++}
++
+ /*
+  * Can member use SET ROLE to this role?
+  *
+@@ -5314,7 +5357,7 @@ member_can_set_role(Oid member, Oid role)
+ 	 * multi-level recursion, then see if target role is any one of them.
+ 	 */
+ 	return list_member_oid(roles_is_member_of(member, ROLERECURSE_SETROLE,
+-											  InvalidOid, NULL),
++											  InvalidOid, NULL, MyDatabaseId),
+ 						   role);
+ }
+ 
+@@ -5360,7 +5403,7 @@ is_member_of_role(Oid member, Oid role)
+ 	 * recursion, then see if target role is any one of them.
+ 	 */
+ 	return list_member_oid(roles_is_member_of(member, ROLERECURSE_MEMBERS,
+-											  InvalidOid, NULL),
++											  InvalidOid, NULL, InvalidOid),
+ 						   role);
+ }
+ 
+@@ -5384,7 +5427,7 @@ is_member_of_role_nosuper(Oid member, Oid role)
+ 	 * recursion, then see if target role is any one of them.
+ 	 */
+ 	return list_member_oid(roles_is_member_of(member, ROLERECURSE_MEMBERS,
+-											  InvalidOid, NULL),
++											  InvalidOid, NULL, InvalidOid),
+ 						   role);
+ }
+ 
+@@ -5395,7 +5438,7 @@ is_member_of_role_nosuper(Oid member, Oid role)
+  * or a superuser?
+  */
+ bool
+-is_admin_of_role(Oid member, Oid role)
++is_admin_of_role(Oid member, Oid role, Oid databaseId)
+ {
+ 	Oid			admin_role;
+ 
+@@ -5406,7 +5449,7 @@ is_admin_of_role(Oid member, Oid role)
+ 	if (member == role)
+ 		return false;
+ 
+-	(void) roles_is_member_of(member, ROLERECURSE_MEMBERS, role, &admin_role);
++	(void) roles_is_member_of(member, ROLERECURSE_MEMBERS, role, &admin_role, databaseId);
+ 	return OidIsValid(admin_role);
+ }
+ 
+@@ -5420,7 +5463,7 @@ is_admin_of_role(Oid member, Oid role)
+  * over more indirect inheritance.
+  */
+ Oid
+-select_best_admin(Oid member, Oid role)
++select_best_admin(Oid member, Oid role, Oid databaseId)
+ {
+ 	Oid			admin_role;
+ 
+@@ -5428,7 +5471,7 @@ select_best_admin(Oid member, Oid role)
+ 	if (member == role)
+ 		return InvalidOid;
+ 
+-	(void) roles_is_member_of(member, ROLERECURSE_PRIVS, role, &admin_role);
++	(void) roles_is_member_of(member, ROLERECURSE_PRIVS, role, &admin_role, databaseId);
+ 	return admin_role;
+ }
+ 
+@@ -5504,7 +5547,7 @@ select_best_grantor(Oid roleId, AclMode privileges,
+ 	 * doesn't query any role memberships.
+ 	 */
+ 	roles_list = roles_is_member_of(roleId, ROLERECURSE_PRIVS,
+-									InvalidOid, NULL);
++									InvalidOid, NULL, InvalidOid);
+ 
+ 	/* initialize candidate result as default */
+ 	*grantorId = roleId;
+diff --git a/src/backend/utils/adt/dbsize.c b/src/backend/utils/adt/dbsize.c
+index e63e99c1416..2f31ecb0c4e 100644
+--- a/src/backend/utils/adt/dbsize.c
++++ b/src/backend/utils/adt/dbsize.c
+@@ -130,7 +130,7 @@ calculate_database_size(Oid dbOid)
+ 	 */
+ 	aclresult = object_aclcheck(DatabaseRelationId, dbOid, GetUserId(), ACL_CONNECT);
+ 	if (aclresult != ACLCHECK_OK &&
+-		!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
++		!has_cluster_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
+ 	{
+ 		aclcheck_error(aclresult, OBJECT_DATABASE,
+ 					   get_database_name(dbOid));
+@@ -214,7 +214,7 @@ calculate_tablespace_size(Oid tblspcOid)
+ 	 * it is default for current database.
+ 	 */
+ 	if (tblspcOid != MyDatabaseTableSpace &&
+-		!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
++		!has_cluster_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
+ 	{
+ 		aclresult = object_aclcheck(TableSpaceRelationId, tblspcOid, GetUserId(), ACL_CREATE);
+ 		if (aclresult != ACLCHECK_OK)
+diff --git a/src/backend/utils/adt/genfile.c b/src/backend/utils/adt/genfile.c
+index 24b95c32b78..5f2a4b5997f 100644
+--- a/src/backend/utils/adt/genfile.c
++++ b/src/backend/utils/adt/genfile.c
+@@ -63,7 +63,7 @@ convert_and_check_filename(text *arg)
+ 	 * access any files on the server as the PG user, so no need to do any
+ 	 * further checks here.
+ 	 */
+-	if (has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
++	if (has_cluster_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
+ 		return filename;
+ 
+ 	/*
+diff --git a/src/backend/utils/adt/pgstatfuncs.c b/src/backend/utils/adt/pgstatfuncs.c
+index f7b50e0b5af..23a3e4ea9e0 100644
+--- a/src/backend/utils/adt/pgstatfuncs.c
++++ b/src/backend/utils/adt/pgstatfuncs.c
+@@ -34,7 +34,7 @@
+ 
+ #define UINT32_ACCESS_ONCE(var)		 ((uint32)(*((volatile uint32 *)&(var))))
+ 
+-#define HAS_PGSTAT_PERMISSIONS(role)	 (has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS) || has_privs_of_role(GetUserId(), role))
++#define HAS_PGSTAT_PERMISSIONS(role)	 (has_cluster_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS) || has_cluster_privs_of_role(GetUserId(), role))
+ 
+ #define PG_STAT_GET_RELENTRY_INT64(stat)						\
+ Datum															\
+diff --git a/src/backend/utils/cache/catcache.c b/src/backend/utils/cache/catcache.c
+index 10276aa1db1..e8b601301c9 100644
+--- a/src/backend/utils/cache/catcache.c
++++ b/src/backend/utils/cache/catcache.c
+@@ -1223,7 +1223,7 @@ IndexScanOK(CatCache *cache)
+ 
+ 		case AUTHNAME:
+ 		case AUTHOID:
+-		case AUTHMEMMEMROLE:
++		case AUTHMEMMEMDBROLE:
+ 		case DATABASEOID:
+ 
+ 			/*
+diff --git a/src/backend/utils/cache/relcache.c b/src/backend/utils/cache/relcache.c
+index c326f687eb4..5a9223c4539 100644
+--- a/src/backend/utils/cache/relcache.c
++++ b/src/backend/utils/cache/relcache.c
+@@ -4211,7 +4211,7 @@ RelationCacheInitializePhase3(void)
+ 							AuthIdRelationId);
+ 		load_critical_index(AuthIdOidIndexId,
+ 							AuthIdRelationId);
+-		load_critical_index(AuthMemMemRoleIndexId,
++		load_critical_index(AuthMemMemRoleDbIndexId,
+ 							AuthMemRelationId);
+ 		load_critical_index(SharedSecLabelObjectIndexId,
+ 							SharedSecLabelRelationId);
+diff --git a/src/backend/utils/init/postinit.c b/src/backend/utils/init/postinit.c
+index a024b1151d0..85f5dec665e 100644
+--- a/src/backend/utils/init/postinit.c
++++ b/src/backend/utils/init/postinit.c
+@@ -922,7 +922,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
+ 					 errmsg("remaining connection slots are reserved for roles with the %s attribute",
+ 							"SUPERUSER")));
+ 
+-		if (!has_privs_of_role(GetUserId(), ROLE_PG_USE_RESERVED_CONNECTIONS))
++		if (!has_cluster_privs_of_role(GetUserId(), ROLE_PG_USE_RESERVED_CONNECTIONS))
+ 			ereport(FATAL,
+ 					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
+ 					 errmsg("remaining connection slots are reserved for roles with privileges of the \"%s\" role",
+diff --git a/src/backend/utils/misc/guc_funcs.c b/src/backend/utils/misc/guc_funcs.c
+index 9c9edd3d2f5..2a845564f1f 100644
+--- a/src/backend/utils/misc/guc_funcs.c
++++ b/src/backend/utils/misc/guc_funcs.c
+@@ -581,7 +581,7 @@ bool
+ ConfigOptionIsVisible(struct config_generic *conf)
+ {
+ 	if ((conf->flags & GUC_SUPERUSER_ONLY) &&
+-		!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_SETTINGS))
++		!has_cluster_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_SETTINGS))
+ 		return false;
+ 	else
+ 		return true;
+@@ -784,7 +784,7 @@ GetConfigOptionValues(struct config_generic *conf, const char **values)
+ 	 * insufficiently-privileged users.
+ 	 */
+ 	if (conf->source == PGC_S_FILE &&
+-		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_SETTINGS))
++		has_cluster_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_SETTINGS))
+ 	{
+ 		values[14] = conf->sourcefile;
+ 		snprintf(buffer, sizeof(buffer), "%d", conf->sourceline);
+diff --git a/src/bin/pg_dump/pg_dumpall.c b/src/bin/pg_dump/pg_dumpall.c
+index e3ad8fb2956..67ebbf24f0d 100644
+--- a/src/bin/pg_dump/pg_dumpall.c
++++ b/src/bin/pg_dump/pg_dumpall.c
+@@ -58,7 +58,7 @@ static void help(void);
+ 
+ static void dropRoles(PGconn *conn);
+ static void dumpRoles(PGconn *conn);
+-static void dumpRoleMembership(PGconn *conn);
++static void dumpRoleMembership(PGconn *conn, const char *databaseId);
+ static void dumpRoleGUCPrivs(PGconn *conn);
+ static void dropTablespaces(PGconn *conn);
+ static void dumpTablespaces(PGconn *conn);
+@@ -594,7 +594,7 @@ main(int argc, char *argv[])
+ 			dumpRoles(conn);
+ 
+ 			/* Dump role memberships */
+-			dumpRoleMembership(conn);
++			dumpRoleMembership(conn, "0");
+ 
+ 			/* Dump role GUC privileges */
+ 			if (server_version >= 150000 && !skip_acls)
+@@ -955,7 +955,7 @@ dumpRoles(PGconn *conn)
+  * no membership yet.
+  */
+ static void
+-dumpRoleMembership(PGconn *conn)
++dumpRoleMembership(PGconn *conn, const char *databaseId)
+ {
+ 	PQExpBuffer buf = createPQExpBuffer();
+ 	PQExpBuffer optbuf = createPQExpBuffer();
+@@ -995,7 +995,8 @@ dumpRoleMembership(PGconn *conn)
+ 					  "LEFT JOIN %s um on um.oid = a.member "
+ 					  "LEFT JOIN %s ug on ug.oid = a.grantor "
+ 					  "WHERE NOT (ur.rolname ~ '^pg_' AND um.rolname ~ '^pg_')"
+-					  "ORDER BY 1,2,4", role_catalog, role_catalog, role_catalog);
++					  " AND a.dbid = %s "
++					  "ORDER BY 1,2,4", role_catalog, role_catalog, role_catalog, databaseId);
+ 	res = executeQuery(conn, buf->data);
+ 	i_inherit_option = PQfnumber(res, "inherit_option");
+ 	i_set_option = PQfnumber(res, "set_option");
+@@ -1110,6 +1111,8 @@ dumpRoleMembership(PGconn *conn)
+ 				resetPQExpBuffer(optbuf);
+ 				fprintf(OPF, "GRANT %s", fmtId(role));
+ 				fprintf(OPF, " TO %s", fmtId(member));
++				if (strcmp(databaseId, "0") != 0)
++					fprintf(OPF, " IN CURRENT DATABASE");
+ 				if (*admin_option == 't')
+ 					appendPQExpBufferStr(optbuf, "ADMIN OPTION");
+ 				if (dump_grant_options)
+@@ -1504,7 +1507,7 @@ dumpDatabases(PGconn *conn)
+ 	 * doesn't have some failure mode with --clean.
+ 	 */
+ 	res = executeQuery(conn,
+-					   "SELECT datname "
++					   "SELECT datname, oid "
+ 					   "FROM pg_database d "
+ 					   "WHERE datallowconn AND datconnlimit != -2 "
+ 					   "ORDER BY (datname <> 'template1'), datname");
+@@ -1515,6 +1518,7 @@ dumpDatabases(PGconn *conn)
+ 	for (i = 0; i < PQntuples(res); i++)
+ 	{
+ 		char	   *dbname = PQgetvalue(res, i, 0);
++		char	   *dbid = PQgetvalue(res, i, 1);
+ 		const char *create_opts;
+ 		int			ret;
+ 
+@@ -1555,6 +1559,10 @@ dumpDatabases(PGconn *conn)
+ 		else
+ 			create_opts = "--create";
+ 
++		/* Dump database-specific roles if server is running 16.0 or later */
++		if (server_version >= 160000)
++			dumpRoleMembership(conn, dbid);
++
+ 		if (filename)
+ 			fclose(OPF);
+ 
+diff --git a/src/include/catalog/pg_auth_members.h b/src/include/catalog/pg_auth_members.h
+index 5f4b30756ca..aa1b80bacad 100644
+--- a/src/include/catalog/pg_auth_members.h
++++ b/src/include/catalog/pg_auth_members.h
+@@ -36,6 +36,8 @@ CATALOG(pg_auth_members,1261,AuthMemRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_
+ 	bool		admin_option;	/* granted with admin option? */
+ 	bool		inherit_option; /* exercise privileges without SET ROLE? */
+ 	bool		set_option;		/* use SET ROLE to the target role? */
++	Oid			dbid BKI_LOOKUP_OPT(pg_database);	/* ID of a database this
++													 * mapping is effective in */
+ } FormData_pg_auth_members;
+ 
+ /* ----------------
+@@ -46,11 +48,11 @@ CATALOG(pg_auth_members,1261,AuthMemRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_
+ typedef FormData_pg_auth_members *Form_pg_auth_members;
+ 
+ DECLARE_UNIQUE_INDEX_PKEY(pg_auth_members_oid_index, 6303, AuthMemOidIndexId, pg_auth_members, btree(oid oid_ops));
+-DECLARE_UNIQUE_INDEX(pg_auth_members_role_member_index, 2694, AuthMemRoleMemIndexId, pg_auth_members, btree(roleid oid_ops, member oid_ops, grantor oid_ops));
+-DECLARE_UNIQUE_INDEX(pg_auth_members_member_role_index, 2695, AuthMemMemRoleIndexId, pg_auth_members, btree(member oid_ops, roleid oid_ops, grantor oid_ops));
++DECLARE_UNIQUE_INDEX(pg_auth_members_role_member_db_index, 2694, AuthMemRoleMemDbIndexId, pg_auth_members, btree(roleid oid_ops, member oid_ops, grantor oid_ops, dbid oid_ops));
++DECLARE_UNIQUE_INDEX(pg_auth_members_member_db_role_index, 2695, AuthMemMemRoleDbIndexId, pg_auth_members, btree(member oid_ops, dbid oid_ops, roleid oid_ops, grantor oid_ops));
+ DECLARE_INDEX(pg_auth_members_grantor_index, 6302, AuthMemGrantorIndexId, pg_auth_members, btree(grantor oid_ops));
+ 
+-MAKE_SYSCACHE(AUTHMEMROLEMEM, pg_auth_members_role_member_index, 8);
+-MAKE_SYSCACHE(AUTHMEMMEMROLE, pg_auth_members_member_role_index, 8);
++MAKE_SYSCACHE(AUTHMEMROLEMEMDB, pg_auth_members_role_member_db_index, 8);
++MAKE_SYSCACHE(AUTHMEMMEMDBROLE, pg_auth_members_member_db_role_index, 8);
+ 
+ #endif							/* PG_AUTH_MEMBERS_H */
+diff --git a/src/include/commands/user.h b/src/include/commands/user.h
+index 97dcb93791b..5444b740008 100644
+--- a/src/include/commands/user.h
++++ b/src/include/commands/user.h
+@@ -35,6 +35,7 @@ extern ObjectAddress RenameRole(const char *oldname, const char *newname);
+ extern void DropOwnedObjects(DropOwnedStmt *stmt);
+ extern void ReassignOwnedObjects(ReassignOwnedStmt *stmt);
+ extern List *roleSpecsToIds(List *memberNames);
++extern void DropDatabaseSpecificRoles(Oid databaseId);
+ 
+ extern bool check_createrole_self_grant(char **newval, void **extra,
+ 										GucSource source);
+diff --git a/src/include/nodes/parsenodes.h b/src/include/nodes/parsenodes.h
+index 1c314cd9074..093dbb4766e 100644
+--- a/src/include/nodes/parsenodes.h
++++ b/src/include/nodes/parsenodes.h
+@@ -2557,6 +2557,9 @@ typedef struct GrantRoleStmt
+ 	NodeTag		type;
+ 	List	   *granted_roles;	/* list of roles to be granted/revoked */
+ 	List	   *grantee_roles;	/* list of member roles to add/delete */
++	char	   *database;		/* name of DB this grant applies to NULL means
++								 * global, "" for the current database,
++								 * otherwise a named database */
+ 	bool		is_grant;		/* true = GRANT, false = REVOKE */
+ 	List	   *opt;			/* options e.g. WITH GRANT OPTION */
+ 	RoleSpec   *grantor;		/* set grantor to other than current role */
+diff --git a/src/include/utils/acl.h b/src/include/utils/acl.h
+index 731d84b2a93..d6e7259e8a2 100644
+--- a/src/include/utils/acl.h
++++ b/src/include/utils/acl.h
+@@ -209,13 +209,14 @@ extern AclMode aclmask(const Acl *acl, Oid roleid, Oid ownerId,
+ 					   AclMode mask, AclMaskHow how);
+ extern int	aclmembers(const Acl *acl, Oid **roleids);
+ 
+-extern bool has_privs_of_role(Oid member, Oid role);
++extern bool has_privs_of_role(Oid member, Oid role, Oid database);
++extern bool has_cluster_privs_of_role(Oid member, Oid role);
+ extern bool member_can_set_role(Oid member, Oid role);
+ extern void check_can_set_role(Oid member, Oid role);
+ extern bool is_member_of_role(Oid member, Oid role);
+ extern bool is_member_of_role_nosuper(Oid member, Oid role);
+-extern bool is_admin_of_role(Oid member, Oid role);
+-extern Oid	select_best_admin(Oid member, Oid role);
++extern bool is_admin_of_role(Oid member, Oid role, Oid databaseId);
++extern Oid	select_best_admin(Oid member, Oid role, Oid databaseId);
+ extern Oid	get_role_oid(const char *rolname, bool missing_ok);
+ extern Oid	get_role_oid_or_public(const char *rolname);
+ extern Oid	get_rolespec_oid(const RoleSpec *role, bool missing_ok);
+diff --git a/src/test/regress/expected/oidjoins.out b/src/test/regress/expected/oidjoins.out
+index 215eb899be3..79fb69059b6 100644
+--- a/src/test/regress/expected/oidjoins.out
++++ b/src/test/regress/expected/oidjoins.out
+@@ -197,6 +197,7 @@ NOTICE:  checking pg_tablespace {spcowner} => pg_authid {oid}
+ NOTICE:  checking pg_auth_members {roleid} => pg_authid {oid}
+ NOTICE:  checking pg_auth_members {member} => pg_authid {oid}
+ NOTICE:  checking pg_auth_members {grantor} => pg_authid {oid}
++NOTICE:  checking pg_auth_members {dbid} => pg_database {oid}
+ NOTICE:  checking pg_shdepend {dbid} => pg_database {oid}
+ NOTICE:  checking pg_shdepend {classid} => pg_class {oid}
+ NOTICE:  checking pg_shdepend {refclassid} => pg_class {oid}
+diff --git a/src/test/regress/expected/privs_in_db.out b/src/test/regress/expected/privs_in_db.out
+new file mode 100644
+index 00000000000..3b8e0674320
+--- /dev/null
++++ b/src/test/regress/expected/privs_in_db.out
+@@ -0,0 +1,767 @@
++--
++-- Tests for database-specific role memberships.
++--
++-- Clean up in case a prior regression run failed
++-- Suppress NOTICE messages when users/groups don't exist
++SET client_min_messages TO 'warning';
++DROP ROLE IF EXISTS regress_priv_group1;
++DROP ROLE IF EXISTS regress_priv_group2;
++DROP DATABASE IF EXISTS regression_db_4;
++DROP DATABASE IF EXISTS regression_db_3;
++DROP DATABASE IF EXISTS regression_db_2;
++DROP DATABASE IF EXISTS regression_db_1;
++DROP ROLE IF EXISTS regress_role_granted;
++DROP ROLE IF EXISTS regress_role_read_34;
++DROP ROLE IF EXISTS regress_role_inherited_3;
++DROP ROLE IF EXISTS regress_role_inherited_34;
++DROP ROLE IF EXISTS regress_role_read_0;
++DROP ROLE IF EXISTS regress_role_read_12;
++DROP ROLE IF EXISTS regress_role_read_12_noinherit;
++DROP ROLE IF EXISTS regress_role_read_all_noinherit;
++DROP ROLE IF EXISTS regress_role_read_all_with_admin;
++DROP DATABASE IF EXISTS regression_db_0;
++DROP ROLE IF EXISTS regress_role_admin;
++RESET client_min_messages;
++-- test proper begins here
++CREATE ROLE regress_role_admin LOGIN CREATEROLE CREATEDB;
++GRANT pg_read_all_data TO regress_role_admin WITH ADMIN OPTION;
++GRANT pg_read_all_stats TO regress_role_admin WITH ADMIN OPTION;
++GRANT pg_maintain TO regress_role_admin WITH ADMIN OPTION;
++-- Populate test databases.
++CREATE DATABASE regression_db_0 OWNER regress_role_admin;
++\connect regression_db_0
++CREATE TABLE data AS SELECT generate_series(1, 3);
++CREATE VIEW regress_role_memberships
++ AS
++SELECT
++  r.rolname as role,
++  m.rolname as member,
++  CASE WHEN g.rolsuper THEN 'superuser' ELSE g.rolname END as grantor,
++  admin_option,
++  d.datname
++FROM pg_auth_members a
++JOIN pg_roles r ON r.oid = a.roleid
++JOIN pg_roles m ON m.oid = a.member
++LEFT JOIN pg_roles g ON g.oid = a.grantor
++LEFT JOIN pg_database d ON d.oid = a.dbid
++WHERE
++  m.rolname LIKE 'regress_role_%'
++ORDER BY
++  1, 2, 5, 3
++;
++CREATE DATABASE regression_db_1 TEMPLATE regression_db_0 OWNER regress_role_admin;
++CREATE DATABASE regression_db_2 TEMPLATE regression_db_1 OWNER regress_role_admin;
++CREATE DATABASE regression_db_3 TEMPLATE regression_db_1 OWNER regress_role_admin;
++CREATE DATABASE regression_db_4 TEMPLATE regression_db_1 OWNER regress_role_admin;
++SET SESSION AUTHORIZATION regress_role_admin;
++-- Read all cluster-wide with admin option
++CREATE ROLE regress_role_read_all_with_admin ROLE regress_role_admin;
++GRANT pg_read_all_data TO regress_role_read_all_with_admin WITH ADMIN OPTION;
++-- Read all in databases 1 and 2
++CREATE ROLE regress_role_read_12 ROLE regress_role_admin;
++GRANT pg_read_all_data TO regress_role_read_12 IN DATABASE regression_db_1;
++GRANT pg_read_all_data TO regress_role_read_12 IN DATABASE regression_db_2;
++-- Read all in databases 3 and 4 with admin option
++CREATE ROLE regress_role_read_34 ROLE regress_role_admin;
++GRANT pg_read_all_data TO regress_role_read_34 IN DATABASE regression_db_3 WITH ADMIN OPTION;
++GRANT pg_read_all_data TO regress_role_read_34 IN DATABASE regression_db_4 WITH ADMIN OPTION;
++-- Inherits read all in databases 3 and 4
++CREATE ROLE regress_role_inherited_34 ROLE regress_role_admin;
++GRANT regress_role_read_34 TO regress_role_inherited_34;
++-- Inherits read all in database 3
++CREATE ROLE regress_role_inherited_3 ROLE regress_role_admin;
++GRANT regress_role_read_34 TO regress_role_inherited_3 IN DATABASE regression_db_3;
++-- No inherit
++CREATE ROLE regress_role_read_all_noinherit NOINHERIT ROLE regress_role_admin;
++GRANT regress_role_read_all_with_admin TO regress_role_read_all_noinherit;
++-- No inherit in databases 1 and 2
++CREATE ROLE regress_role_read_12_noinherit NOINHERIT ROLE regress_role_admin;
++GRANT regress_role_read_12 TO regress_role_read_12_noinherit;
++-- Alternate syntax
++CREATE ROLE regress_role_read_0;
++GRANT pg_read_all_data TO regress_role_read_0, regress_role_read_all_noinherit IN CURRENT DATABASE;
++-- Failure due to missing database
++GRANT pg_read_all_data TO regress_role_read_0 IN DATABASE non_existent; -- error
++ERROR:  database "non_existent" does not exist
++-- Should warn on duplicate grants
++GRANT pg_read_all_data TO regress_role_read_all_with_admin; -- notice
++NOTICE:  role "regress_role_read_all_with_admin" has already been granted membership in role "pg_read_all_data" by role "regress_role_admin"
++GRANT pg_read_all_data TO regress_role_read_0 IN DATABASE regression_db_0; -- notice
++NOTICE:  role "regress_role_read_0" has already been granted membership in role "pg_read_all_data" in database "regression_db_0" by role "regress_role_admin"
++-- Should not warn if adjusting admin option
++GRANT pg_read_all_data TO regress_role_read_0 IN DATABASE regression_db_0 WITH ADMIN OPTION; -- silent
++GRANT pg_read_all_data TO regress_role_read_0 IN DATABASE regression_db_0 WITH ADMIN OPTION; -- notice
++NOTICE:  role "regress_role_read_0" has already been granted membership in role "pg_read_all_data" in database "regression_db_0" by role "regress_role_admin"
++GRANT pg_maintain TO regress_role_read_12 IN DATABASE regression_db_2;
++-- Cluster-wide role
++GRANT pg_read_all_stats TO regress_role_read_0;
++GRANT pg_read_all_stats TO regress_role_read_34 IN DATABASE regression_db_3;  -- makes no sense XXX
++-- Check membership table
++TABLE regress_role_memberships;
++               role               |              member              |      grantor       | admin_option |     datname     
++----------------------------------+----------------------------------+--------------------+--------------+-----------------
++ pg_maintain                      | regress_role_admin               | superuser          | t            | 
++ pg_maintain                      | regress_role_read_12             | regress_role_admin | f            | regression_db_2
++ pg_read_all_data                 | regress_role_admin               | superuser          | t            | 
++ pg_read_all_data                 | regress_role_read_0              | regress_role_admin | t            | regression_db_0
++ pg_read_all_data                 | regress_role_read_12             | regress_role_admin | f            | regression_db_1
++ pg_read_all_data                 | regress_role_read_12             | regress_role_admin | f            | regression_db_2
++ pg_read_all_data                 | regress_role_read_34             | regress_role_admin | t            | regression_db_3
++ pg_read_all_data                 | regress_role_read_34             | regress_role_admin | t            | regression_db_4
++ pg_read_all_data                 | regress_role_read_all_noinherit  | regress_role_admin | f            | regression_db_0
++ pg_read_all_data                 | regress_role_read_all_with_admin | regress_role_admin | t            | 
++ pg_read_all_stats                | regress_role_admin               | superuser          | t            | 
++ pg_read_all_stats                | regress_role_read_0              | regress_role_admin | f            | 
++ pg_read_all_stats                | regress_role_read_34             | regress_role_admin | f            | regression_db_3
++ regress_role_inherited_3         | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_inherited_3         | regress_role_admin               | superuser          | t            | 
++ regress_role_inherited_34        | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_inherited_34        | regress_role_admin               | superuser          | t            | 
++ regress_role_read_0              | regress_role_admin               | superuser          | t            | 
++ regress_role_read_12             | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_12             | regress_role_admin               | superuser          | t            | 
++ regress_role_read_12             | regress_role_read_12_noinherit   | regress_role_admin | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | superuser          | t            | 
++ regress_role_read_34             | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_34             | regress_role_admin               | superuser          | t            | 
++ regress_role_read_34             | regress_role_inherited_3         | regress_role_admin | f            | regression_db_3
++ regress_role_read_34             | regress_role_inherited_34        | regress_role_admin | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | superuser          | t            | 
++ regress_role_read_all_with_admin | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_all_with_admin | regress_role_admin               | superuser          | t            | 
++ regress_role_read_all_with_admin | regress_role_read_all_noinherit  | regress_role_admin | f            | 
++(32 rows)
++
++-- Test membership privileges (regression_db_1)
++\connect regression_db_1
++SET SESSION AUTHORIZATION regress_role_admin;
++SET ROLE regress_role_read_all_with_admin;
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET ROLE regress_role_read_12;
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET ROLE regress_role_read_34;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_inherited_34;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_inherited_3;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET SESSION AUTHORIZATION regress_role_read_12;
++VACUUM data; -- error
++WARNING:  permission denied to vacuum "data", skipping it
++SET ROLE pg_read_all_data; -- success
++SET SESSION AUTHORIZATION regress_role_inherited_34;
++SET ROLE pg_read_all_data; -- error
++ERROR:  permission denied to set role "pg_read_all_data"
++SET ROLE regress_role_read_34; -- success
++SET SESSION AUTHORIZATION regress_role_inherited_3;
++SET ROLE pg_read_all_data; -- error
++ERROR:  permission denied to set role "pg_read_all_data"
++SET ROLE regress_role_read_34; -- error
++ERROR:  permission denied to set role "regress_role_read_34"
++SET SESSION AUTHORIZATION regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE pg_read_all_data; -- success
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET SESSION AUTHORIZATION regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_12; -- success
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++-- Test membership privileges (regression_db_2)
++\connect regression_db_2
++SET SESSION AUTHORIZATION regress_role_admin;
++SET ROLE regress_role_read_all_with_admin;
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET ROLE regress_role_read_12;
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET ROLE regress_role_read_34;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_inherited_34;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_inherited_3;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET SESSION AUTHORIZATION regress_role_read_12;
++VACUUM data; -- success
++SET ROLE pg_read_all_data; -- success
++SET SESSION AUTHORIZATION regress_role_inherited_34;
++SET ROLE pg_read_all_data; -- error
++ERROR:  permission denied to set role "pg_read_all_data"
++SET ROLE regress_role_read_34; -- success
++SET SESSION AUTHORIZATION regress_role_inherited_3;
++SET ROLE pg_read_all_data; -- error
++ERROR:  permission denied to set role "pg_read_all_data"
++SET ROLE regress_role_read_34; -- error
++ERROR:  permission denied to set role "regress_role_read_34"
++SET SESSION AUTHORIZATION regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE pg_read_all_data; -- success
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET SESSION AUTHORIZATION regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_12; -- success
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++-- Test membership privileges (regression_db_3)
++\connect regression_db_3
++SET SESSION AUTHORIZATION regress_role_admin;
++SET ROLE regress_role_read_all_with_admin;
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET ROLE regress_role_read_12;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_34;
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET ROLE regress_role_inherited_34;
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET ROLE regress_role_inherited_3;
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET ROLE regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET SESSION AUTHORIZATION regress_role_read_12;
++SET ROLE pg_read_all_data; -- error
++ERROR:  permission denied to set role "pg_read_all_data"
++SET SESSION AUTHORIZATION regress_role_inherited_34;
++SET ROLE pg_read_all_data; -- success
++SET ROLE regress_role_read_34; -- success
++SET SESSION AUTHORIZATION regress_role_inherited_3;
++SET ROLE pg_read_all_data; -- success
++SET ROLE regress_role_read_34; -- success
++SET SESSION AUTHORIZATION regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE pg_read_all_data; -- success
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET SESSION AUTHORIZATION regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_12; -- error
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++-- Test membership privileges (regression_db_4)
++\connect regression_db_4
++SET SESSION AUTHORIZATION regress_role_admin;
++SET ROLE regress_role_read_all_with_admin;
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET ROLE regress_role_read_12;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_34;
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET ROLE regress_role_inherited_34;
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET ROLE regress_role_inherited_3;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET SESSION AUTHORIZATION regress_role_read_12;
++SET ROLE pg_read_all_data; -- error
++ERROR:  permission denied to set role "pg_read_all_data"
++SET SESSION AUTHORIZATION regress_role_inherited_34;
++SET ROLE pg_read_all_data; -- success
++SET ROLE regress_role_read_34; -- success
++SET SESSION AUTHORIZATION regress_role_inherited_3;
++SET ROLE pg_read_all_data; -- error
++ERROR:  permission denied to set role "pg_read_all_data"
++SET ROLE regress_role_read_34; -- error
++ERROR:  permission denied to set role "regress_role_read_34"
++SET SESSION AUTHORIZATION regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE pg_read_all_data; -- success
++SELECT * FROM data; -- success
++ generate_series 
++-----------------
++               1
++               2
++               3
++(3 rows)
++
++SET SESSION AUTHORIZATION regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++SET ROLE regress_role_read_12; -- error
++SELECT * FROM data; -- error
++ERROR:  permission denied for table data
++\connect regression_db_0
++-- Test cluster-wide role
++SET SESSION AUTHORIZATION regress_role_read_0;
++SELECT query FROM pg_stat_activity WHERE datname = 'regression_db_0';
++                                 query                                 
++-----------------------------------------------------------------------
++ SELECT query FROM pg_stat_activity WHERE datname = 'regression_db_0';
++(1 row)
++
++SET SESSION AUTHORIZATION regress_role_read_12;
++SELECT query FROM pg_stat_activity WHERE datname = 'regression_db_0';
++          query           
++--------------------------
++ <insufficient privilege>
++(1 row)
++
++\connect regression_db_3
++SET SESSION AUTHORIZATION regress_role_read_34;
++SELECT application_name, query FROM pg_stat_activity WHERE datname = 'regression_db_3';
++    application_name    |          query           
++------------------------+--------------------------
++ pg_regress/privs_in_db | <insufficient privilege>
++(1 row)
++
++\connect regression_db_0
++SET SESSION AUTHORIZATION regress_role_admin;
++-- Should not warn if revoking admin option
++REVOKE ADMIN OPTION FOR pg_read_all_data FROM regress_role_read_0 IN DATABASE regression_db_0; -- silent
++REVOKE ADMIN OPTION FOR pg_read_all_data FROM regress_role_read_0 IN DATABASE regression_db_0; -- silent
++TABLE regress_role_memberships;
++               role               |              member              |      grantor       | admin_option |     datname     
++----------------------------------+----------------------------------+--------------------+--------------+-----------------
++ pg_maintain                      | regress_role_admin               | superuser          | t            | 
++ pg_maintain                      | regress_role_read_12             | regress_role_admin | f            | regression_db_2
++ pg_read_all_data                 | regress_role_admin               | superuser          | t            | 
++ pg_read_all_data                 | regress_role_read_0              | regress_role_admin | f            | regression_db_0
++ pg_read_all_data                 | regress_role_read_12             | regress_role_admin | f            | regression_db_1
++ pg_read_all_data                 | regress_role_read_12             | regress_role_admin | f            | regression_db_2
++ pg_read_all_data                 | regress_role_read_34             | regress_role_admin | t            | regression_db_3
++ pg_read_all_data                 | regress_role_read_34             | regress_role_admin | t            | regression_db_4
++ pg_read_all_data                 | regress_role_read_all_noinherit  | regress_role_admin | f            | regression_db_0
++ pg_read_all_data                 | regress_role_read_all_with_admin | regress_role_admin | t            | 
++ pg_read_all_stats                | regress_role_admin               | superuser          | t            | 
++ pg_read_all_stats                | regress_role_read_0              | regress_role_admin | f            | 
++ pg_read_all_stats                | regress_role_read_34             | regress_role_admin | f            | regression_db_3
++ regress_role_inherited_3         | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_inherited_3         | regress_role_admin               | superuser          | t            | 
++ regress_role_inherited_34        | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_inherited_34        | regress_role_admin               | superuser          | t            | 
++ regress_role_read_0              | regress_role_admin               | superuser          | t            | 
++ regress_role_read_12             | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_12             | regress_role_admin               | superuser          | t            | 
++ regress_role_read_12             | regress_role_read_12_noinherit   | regress_role_admin | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | superuser          | t            | 
++ regress_role_read_34             | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_34             | regress_role_admin               | superuser          | t            | 
++ regress_role_read_34             | regress_role_inherited_3         | regress_role_admin | f            | regression_db_3
++ regress_role_read_34             | regress_role_inherited_34        | regress_role_admin | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | superuser          | t            | 
++ regress_role_read_all_with_admin | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_all_with_admin | regress_role_admin               | superuser          | t            | 
++ regress_role_read_all_with_admin | regress_role_read_all_noinherit  | regress_role_admin | f            | 
++(32 rows)
++
++-- Should warn if revoking a non-existent membership
++REVOKE pg_read_all_data FROM regress_role_read_0 IN DATABASE regression_db_0; -- success
++REVOKE pg_read_all_data FROM regress_role_read_0 IN DATABASE regression_db_0; -- warning
++WARNING:  role "regress_role_read_0" has not been granted membership in role "pg_read_all_data" by role "regress_role_admin"
++TABLE regress_role_memberships;
++               role               |              member              |      grantor       | admin_option |     datname     
++----------------------------------+----------------------------------+--------------------+--------------+-----------------
++ pg_maintain                      | regress_role_admin               | superuser          | t            | 
++ pg_maintain                      | regress_role_read_12             | regress_role_admin | f            | regression_db_2
++ pg_read_all_data                 | regress_role_admin               | superuser          | t            | 
++ pg_read_all_data                 | regress_role_read_12             | regress_role_admin | f            | regression_db_1
++ pg_read_all_data                 | regress_role_read_12             | regress_role_admin | f            | regression_db_2
++ pg_read_all_data                 | regress_role_read_34             | regress_role_admin | t            | regression_db_3
++ pg_read_all_data                 | regress_role_read_34             | regress_role_admin | t            | regression_db_4
++ pg_read_all_data                 | regress_role_read_all_noinherit  | regress_role_admin | f            | regression_db_0
++ pg_read_all_data                 | regress_role_read_all_with_admin | regress_role_admin | t            | 
++ pg_read_all_stats                | regress_role_admin               | superuser          | t            | 
++ pg_read_all_stats                | regress_role_read_0              | regress_role_admin | f            | 
++ pg_read_all_stats                | regress_role_read_34             | regress_role_admin | f            | regression_db_3
++ regress_role_inherited_3         | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_inherited_3         | regress_role_admin               | superuser          | t            | 
++ regress_role_inherited_34        | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_inherited_34        | regress_role_admin               | superuser          | t            | 
++ regress_role_read_0              | regress_role_admin               | superuser          | t            | 
++ regress_role_read_12             | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_12             | regress_role_admin               | superuser          | t            | 
++ regress_role_read_12             | regress_role_read_12_noinherit   | regress_role_admin | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | superuser          | t            | 
++ regress_role_read_34             | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_34             | regress_role_admin               | superuser          | t            | 
++ regress_role_read_34             | regress_role_inherited_3         | regress_role_admin | f            | regression_db_3
++ regress_role_read_34             | regress_role_inherited_34        | regress_role_admin | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | superuser          | t            | 
++ regress_role_read_all_with_admin | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_all_with_admin | regress_role_admin               | superuser          | t            | 
++ regress_role_read_all_with_admin | regress_role_read_all_noinherit  | regress_role_admin | f            | 
++(31 rows)
++
++-- Revoke should only apply to the specified level
++REVOKE pg_read_all_data FROM regress_role_read_12; -- warning
++TABLE regress_role_memberships;
++               role               |              member              |      grantor       | admin_option |     datname     
++----------------------------------+----------------------------------+--------------------+--------------+-----------------
++ pg_maintain                      | regress_role_admin               | superuser          | t            | 
++ pg_maintain                      | regress_role_read_12             | regress_role_admin | f            | regression_db_2
++ pg_read_all_data                 | regress_role_admin               | superuser          | t            | 
++ pg_read_all_data                 | regress_role_read_12             | regress_role_admin | f            | regression_db_2
++ pg_read_all_data                 | regress_role_read_34             | regress_role_admin | t            | regression_db_3
++ pg_read_all_data                 | regress_role_read_34             | regress_role_admin | t            | regression_db_4
++ pg_read_all_data                 | regress_role_read_all_noinherit  | regress_role_admin | f            | regression_db_0
++ pg_read_all_data                 | regress_role_read_all_with_admin | regress_role_admin | t            | 
++ pg_read_all_stats                | regress_role_admin               | superuser          | t            | 
++ pg_read_all_stats                | regress_role_read_0              | regress_role_admin | f            | 
++ pg_read_all_stats                | regress_role_read_34             | regress_role_admin | f            | regression_db_3
++ regress_role_inherited_3         | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_inherited_3         | regress_role_admin               | superuser          | t            | 
++ regress_role_inherited_34        | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_inherited_34        | regress_role_admin               | superuser          | t            | 
++ regress_role_read_0              | regress_role_admin               | superuser          | t            | 
++ regress_role_read_12             | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_12             | regress_role_admin               | superuser          | t            | 
++ regress_role_read_12             | regress_role_read_12_noinherit   | regress_role_admin | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | superuser          | t            | 
++ regress_role_read_34             | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_34             | regress_role_admin               | superuser          | t            | 
++ regress_role_read_34             | regress_role_inherited_3         | regress_role_admin | f            | regression_db_3
++ regress_role_read_34             | regress_role_inherited_34        | regress_role_admin | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | superuser          | t            | 
++ regress_role_read_all_with_admin | regress_role_admin               | regress_role_admin | f            | 
++ regress_role_read_all_with_admin | regress_role_admin               | superuser          | t            | 
++ regress_role_read_all_with_admin | regress_role_read_all_noinherit  | regress_role_admin | f            | 
++(30 rows)
++
++-- Ensure cluster-wide admin option can grant cluster-wide and in specific databases
++CREATE ROLE regress_role_granted;
++SET SESSION AUTHORIZATION regress_role_read_all_with_admin;
++GRANT pg_read_all_data TO regress_role_granted; -- success
++GRANT pg_read_all_data TO regress_role_granted IN CURRENT DATABASE; -- success
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_1; -- success
++GRANT regress_role_read_34 TO regress_role_granted; -- error
++ERROR:  permission denied to grant role "regress_role_read_34"
++DETAIL:  Only roles with the ADMIN option on role "regress_role_read_34" may grant this role.
++TABLE regress_role_memberships;
++               role               |              member              |             grantor              | admin_option |     datname     
++----------------------------------+----------------------------------+----------------------------------+--------------+-----------------
++ pg_maintain                      | regress_role_admin               | superuser                        | t            | 
++ pg_maintain                      | regress_role_read_12             | regress_role_admin               | f            | regression_db_2
++ pg_read_all_data                 | regress_role_admin               | superuser                        | t            | 
++ pg_read_all_data                 | regress_role_granted             | regress_role_read_all_with_admin | f            | regression_db_0
++ pg_read_all_data                 | regress_role_granted             | regress_role_read_all_with_admin | f            | regression_db_1
++ pg_read_all_data                 | regress_role_granted             | regress_role_read_all_with_admin | f            | 
++ pg_read_all_data                 | regress_role_read_12             | regress_role_admin               | f            | regression_db_2
++ pg_read_all_data                 | regress_role_read_34             | regress_role_admin               | t            | regression_db_3
++ pg_read_all_data                 | regress_role_read_34             | regress_role_admin               | t            | regression_db_4
++ pg_read_all_data                 | regress_role_read_all_noinherit  | regress_role_admin               | f            | regression_db_0
++ pg_read_all_data                 | regress_role_read_all_with_admin | regress_role_admin               | t            | 
++ pg_read_all_stats                | regress_role_admin               | superuser                        | t            | 
++ pg_read_all_stats                | regress_role_read_0              | regress_role_admin               | f            | 
++ pg_read_all_stats                | regress_role_read_34             | regress_role_admin               | f            | regression_db_3
++ regress_role_granted             | regress_role_admin               | superuser                        | t            | 
++ regress_role_inherited_3         | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_inherited_3         | regress_role_admin               | superuser                        | t            | 
++ regress_role_inherited_34        | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_inherited_34        | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_0              | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_12             | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_12             | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_12             | regress_role_read_12_noinherit   | regress_role_admin               | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_34             | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_34             | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_34             | regress_role_inherited_3         | regress_role_admin               | f            | regression_db_3
++ regress_role_read_34             | regress_role_inherited_34        | regress_role_admin               | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_all_with_admin | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_all_with_admin | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_all_with_admin | regress_role_read_all_noinherit  | regress_role_admin               | f            | 
++(34 rows)
++
++-- Ensure database-specific admin option can only grant within that database
++SET SESSION AUTHORIZATION regress_role_read_34;
++GRANT pg_read_all_data TO regress_role_granted; -- error
++ERROR:  permission denied to grant role "pg_read_all_data"
++DETAIL:  Only roles with the ADMIN option on role "pg_read_all_data" may grant this role.
++GRANT pg_read_all_data TO regress_role_granted IN CURRENT DATABASE; -- error
++ERROR:  permission denied to grant role "pg_read_all_data"
++DETAIL:  Only roles with the ADMIN option on role "pg_read_all_data" may grant this role.
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_3; -- error
++ERROR:  permission denied to grant role "pg_read_all_data"
++DETAIL:  Only roles with the ADMIN option on role "pg_read_all_data" may grant this role.
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_4; -- error
++ERROR:  permission denied to grant role "pg_read_all_data"
++DETAIL:  Only roles with the ADMIN option on role "pg_read_all_data" may grant this role.
++\connect regression_db_3
++SET SESSION AUTHORIZATION regress_role_read_34;
++GRANT pg_read_all_data TO regress_role_granted; -- error
++ERROR:  permission denied to grant role "pg_read_all_data"
++DETAIL:  Only roles with the ADMIN option on role "pg_read_all_data" may grant this role.
++GRANT pg_read_all_data TO regress_role_granted IN CURRENT DATABASE; -- success
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_3; -- notice
++NOTICE:  role "regress_role_granted" has already been granted membership in role "pg_read_all_data" in database "regression_db_3" by role "regress_role_read_34"
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_4; -- error
++ERROR:  permission denied to grant role "pg_read_all_data"
++DETAIL:  Only roles with the ADMIN option on role "pg_read_all_data" may grant this role.
++\connect regression_db_4
++SET SESSION AUTHORIZATION regress_role_read_34;
++GRANT pg_read_all_data TO regress_role_granted; -- error
++ERROR:  permission denied to grant role "pg_read_all_data"
++DETAIL:  Only roles with the ADMIN option on role "pg_read_all_data" may grant this role.
++GRANT pg_read_all_data TO regress_role_granted IN CURRENT DATABASE; -- success
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_3; -- error
++ERROR:  permission denied to grant role "pg_read_all_data"
++DETAIL:  Only roles with the ADMIN option on role "pg_read_all_data" may grant this role.
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_4; -- notice
++NOTICE:  role "regress_role_granted" has already been granted membership in role "pg_read_all_data" in database "regression_db_4" by role "regress_role_read_34"
++\connect regression_db_0
++SET SESSION AUTHORIZATION regress_role_admin;
++TABLE regress_role_memberships;
++               role               |              member              |             grantor              | admin_option |     datname     
++----------------------------------+----------------------------------+----------------------------------+--------------+-----------------
++ pg_maintain                      | regress_role_admin               | superuser                        | t            | 
++ pg_maintain                      | regress_role_read_12             | regress_role_admin               | f            | regression_db_2
++ pg_read_all_data                 | regress_role_admin               | superuser                        | t            | 
++ pg_read_all_data                 | regress_role_granted             | regress_role_read_all_with_admin | f            | regression_db_0
++ pg_read_all_data                 | regress_role_granted             | regress_role_read_all_with_admin | f            | regression_db_1
++ pg_read_all_data                 | regress_role_granted             | regress_role_read_34             | f            | regression_db_3
++ pg_read_all_data                 | regress_role_granted             | regress_role_read_34             | f            | regression_db_4
++ pg_read_all_data                 | regress_role_granted             | regress_role_read_all_with_admin | f            | 
++ pg_read_all_data                 | regress_role_read_12             | regress_role_admin               | f            | regression_db_2
++ pg_read_all_data                 | regress_role_read_34             | regress_role_admin               | t            | regression_db_3
++ pg_read_all_data                 | regress_role_read_34             | regress_role_admin               | t            | regression_db_4
++ pg_read_all_data                 | regress_role_read_all_noinherit  | regress_role_admin               | f            | regression_db_0
++ pg_read_all_data                 | regress_role_read_all_with_admin | regress_role_admin               | t            | 
++ pg_read_all_stats                | regress_role_admin               | superuser                        | t            | 
++ pg_read_all_stats                | regress_role_read_0              | regress_role_admin               | f            | 
++ pg_read_all_stats                | regress_role_read_34             | regress_role_admin               | f            | regression_db_3
++ regress_role_granted             | regress_role_admin               | superuser                        | t            | 
++ regress_role_inherited_3         | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_inherited_3         | regress_role_admin               | superuser                        | t            | 
++ regress_role_inherited_34        | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_inherited_34        | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_0              | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_12             | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_12             | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_12             | regress_role_read_12_noinherit   | regress_role_admin               | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_34             | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_34             | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_34             | regress_role_inherited_3         | regress_role_admin               | f            | regression_db_3
++ regress_role_read_34             | regress_role_inherited_34        | regress_role_admin               | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_all_with_admin | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_all_with_admin | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_all_with_admin | regress_role_read_all_noinherit  | regress_role_admin               | f            | 
++(36 rows)
++
++-- Should clean up the membership table when dropping a database
++DROP DATABASE regression_db_4;
++DROP DATABASE regression_db_3;
++DROP DATABASE regression_db_2;
++DROP DATABASE regression_db_1;
++TABLE regress_role_memberships;
++               role               |              member              |             grantor              | admin_option |     datname     
++----------------------------------+----------------------------------+----------------------------------+--------------+-----------------
++ pg_maintain                      | regress_role_admin               | superuser                        | t            | 
++ pg_read_all_data                 | regress_role_admin               | superuser                        | t            | 
++ pg_read_all_data                 | regress_role_granted             | regress_role_read_all_with_admin | f            | regression_db_0
++ pg_read_all_data                 | regress_role_granted             | regress_role_read_all_with_admin | f            | 
++ pg_read_all_data                 | regress_role_read_all_noinherit  | regress_role_admin               | f            | regression_db_0
++ pg_read_all_data                 | regress_role_read_all_with_admin | regress_role_admin               | t            | 
++ pg_read_all_stats                | regress_role_admin               | superuser                        | t            | 
++ pg_read_all_stats                | regress_role_read_0              | regress_role_admin               | f            | 
++ regress_role_granted             | regress_role_admin               | superuser                        | t            | 
++ regress_role_inherited_3         | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_inherited_3         | regress_role_admin               | superuser                        | t            | 
++ regress_role_inherited_34        | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_inherited_34        | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_0              | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_12             | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_12             | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_12             | regress_role_read_12_noinherit   | regress_role_admin               | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_12_noinherit   | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_34             | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_34             | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_34             | regress_role_inherited_34        | regress_role_admin               | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_all_noinherit  | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_all_with_admin | regress_role_admin               | regress_role_admin               | f            | 
++ regress_role_read_all_with_admin | regress_role_admin               | superuser                        | t            | 
++ regress_role_read_all_with_admin | regress_role_read_all_noinherit  | regress_role_admin               | f            | 
++(27 rows)
++
++-- Should clean up the membership table when dropping a role
++DROP ROLE regress_role_granted;  -- dependency of 'regress_role_read_34'
++DROP ROLE regress_role_read_34;
++DROP ROLE regress_role_inherited_3;
++DROP ROLE regress_role_inherited_34;
++DROP ROLE regress_role_read_0;
++DROP ROLE regress_role_read_12;
++DROP ROLE regress_role_read_12_noinherit;
++DROP ROLE regress_role_read_all_noinherit;
++DROP ROLE regress_role_read_all_with_admin;
++RESET SESSION AUTHORIZATION;
++DROP OWNED BY regress_role_admin CASCADE;
++TABLE regress_role_memberships;
++       role        |       member       |  grantor  | admin_option | datname 
++-------------------+--------------------+-----------+--------------+---------
++ pg_maintain       | regress_role_admin | superuser | t            | 
++ pg_read_all_data  | regress_role_admin | superuser | t            | 
++ pg_read_all_stats | regress_role_admin | superuser | t            | 
++(3 rows)
++
++\connect template1
++DROP DATABASE regression_db_0;
++DROP ROLE regress_role_admin;
++SELECT datname FROM pg_database WHERE datname LIKE 'regression_db_%';
++ datname 
++---------
++(0 rows)
++
++SELECT rolname FROM pg_roles WHERE rolname LIKE 'regress_role_%';
++ rolname 
++---------
++(0 rows)
++
+diff --git a/src/test/regress/parallel_schedule b/src/test/regress/parallel_schedule
+index 4f38104ba01..35d5f67059a 100644
+--- a/src/test/regress/parallel_schedule
++++ b/src/test/regress/parallel_schedule
+@@ -92,7 +92,7 @@ test: write_parallel
+ test: vacuum_parallel
+ 
+ # no relation related tests can be put in this group
+-test: publication subscription
++test: publication subscription privs_in_db
+ 
+ # ----------
+ # Another group of parallel tests
+diff --git a/src/test/regress/sql/privs_in_db.sql b/src/test/regress/sql/privs_in_db.sql
+new file mode 100644
+index 00000000000..c2c009d6c5f
+--- /dev/null
++++ b/src/test/regress/sql/privs_in_db.sql
+@@ -0,0 +1,370 @@
++--
++-- Tests for database-specific role memberships.
++--
++
++-- Clean up in case a prior regression run failed
++
++-- Suppress NOTICE messages when users/groups don't exist
++SET client_min_messages TO 'warning';
++
++DROP ROLE IF EXISTS regress_priv_group1;
++DROP ROLE IF EXISTS regress_priv_group2;
++
++DROP DATABASE IF EXISTS regression_db_4;
++DROP DATABASE IF EXISTS regression_db_3;
++DROP DATABASE IF EXISTS regression_db_2;
++DROP DATABASE IF EXISTS regression_db_1;
++DROP ROLE IF EXISTS regress_role_granted;
++DROP ROLE IF EXISTS regress_role_read_34;
++DROP ROLE IF EXISTS regress_role_inherited_3;
++DROP ROLE IF EXISTS regress_role_inherited_34;
++DROP ROLE IF EXISTS regress_role_read_0;
++DROP ROLE IF EXISTS regress_role_read_12;
++DROP ROLE IF EXISTS regress_role_read_12_noinherit;
++DROP ROLE IF EXISTS regress_role_read_all_noinherit;
++DROP ROLE IF EXISTS regress_role_read_all_with_admin;
++DROP DATABASE IF EXISTS regression_db_0;
++DROP ROLE IF EXISTS regress_role_admin;
++
++RESET client_min_messages;
++
++-- test proper begins here
++
++CREATE ROLE regress_role_admin LOGIN CREATEROLE CREATEDB;
++GRANT pg_read_all_data TO regress_role_admin WITH ADMIN OPTION;
++GRANT pg_read_all_stats TO regress_role_admin WITH ADMIN OPTION;
++GRANT pg_maintain TO regress_role_admin WITH ADMIN OPTION;
++
++-- Populate test databases.
++CREATE DATABASE regression_db_0 OWNER regress_role_admin;
++
++\connect regression_db_0
++CREATE TABLE data AS SELECT generate_series(1, 3);
++
++CREATE VIEW regress_role_memberships
++ AS
++SELECT
++  r.rolname as role,
++  m.rolname as member,
++  CASE WHEN g.rolsuper THEN 'superuser' ELSE g.rolname END as grantor,
++  admin_option,
++  d.datname
++FROM pg_auth_members a
++JOIN pg_roles r ON r.oid = a.roleid
++JOIN pg_roles m ON m.oid = a.member
++LEFT JOIN pg_roles g ON g.oid = a.grantor
++LEFT JOIN pg_database d ON d.oid = a.dbid
++WHERE
++  m.rolname LIKE 'regress_role_%'
++ORDER BY
++  1, 2, 5, 3
++;
++
++CREATE DATABASE regression_db_1 TEMPLATE regression_db_0 OWNER regress_role_admin;
++CREATE DATABASE regression_db_2 TEMPLATE regression_db_1 OWNER regress_role_admin;
++CREATE DATABASE regression_db_3 TEMPLATE regression_db_1 OWNER regress_role_admin;
++CREATE DATABASE regression_db_4 TEMPLATE regression_db_1 OWNER regress_role_admin;
++
++SET SESSION AUTHORIZATION regress_role_admin;
++
++-- Read all cluster-wide with admin option
++CREATE ROLE regress_role_read_all_with_admin ROLE regress_role_admin;
++GRANT pg_read_all_data TO regress_role_read_all_with_admin WITH ADMIN OPTION;
++
++-- Read all in databases 1 and 2
++CREATE ROLE regress_role_read_12 ROLE regress_role_admin;
++GRANT pg_read_all_data TO regress_role_read_12 IN DATABASE regression_db_1;
++GRANT pg_read_all_data TO regress_role_read_12 IN DATABASE regression_db_2;
++
++-- Read all in databases 3 and 4 with admin option
++CREATE ROLE regress_role_read_34 ROLE regress_role_admin;
++GRANT pg_read_all_data TO regress_role_read_34 IN DATABASE regression_db_3 WITH ADMIN OPTION;
++GRANT pg_read_all_data TO regress_role_read_34 IN DATABASE regression_db_4 WITH ADMIN OPTION;
++
++-- Inherits read all in databases 3 and 4
++CREATE ROLE regress_role_inherited_34 ROLE regress_role_admin;
++GRANT regress_role_read_34 TO regress_role_inherited_34;
++
++-- Inherits read all in database 3
++CREATE ROLE regress_role_inherited_3 ROLE regress_role_admin;
++GRANT regress_role_read_34 TO regress_role_inherited_3 IN DATABASE regression_db_3;
++
++-- No inherit
++CREATE ROLE regress_role_read_all_noinherit NOINHERIT ROLE regress_role_admin;
++GRANT regress_role_read_all_with_admin TO regress_role_read_all_noinherit;
++
++-- No inherit in databases 1 and 2
++CREATE ROLE regress_role_read_12_noinherit NOINHERIT ROLE regress_role_admin;
++GRANT regress_role_read_12 TO regress_role_read_12_noinherit;
++
++-- Alternate syntax
++CREATE ROLE regress_role_read_0;
++GRANT pg_read_all_data TO regress_role_read_0, regress_role_read_all_noinherit IN CURRENT DATABASE;
++
++-- Failure due to missing database
++GRANT pg_read_all_data TO regress_role_read_0 IN DATABASE non_existent; -- error
++
++-- Should warn on duplicate grants
++GRANT pg_read_all_data TO regress_role_read_all_with_admin; -- notice
++GRANT pg_read_all_data TO regress_role_read_0 IN DATABASE regression_db_0; -- notice
++
++-- Should not warn if adjusting admin option
++GRANT pg_read_all_data TO regress_role_read_0 IN DATABASE regression_db_0 WITH ADMIN OPTION; -- silent
++GRANT pg_read_all_data TO regress_role_read_0 IN DATABASE regression_db_0 WITH ADMIN OPTION; -- notice
++
++GRANT pg_maintain TO regress_role_read_12 IN DATABASE regression_db_2;
++
++-- Cluster-wide role
++GRANT pg_read_all_stats TO regress_role_read_0;
++GRANT pg_read_all_stats TO regress_role_read_34 IN DATABASE regression_db_3;  -- makes no sense XXX
++
++-- Check membership table
++TABLE regress_role_memberships;
++
++-- Test membership privileges (regression_db_1)
++\connect regression_db_1
++SET SESSION AUTHORIZATION regress_role_admin;
++SET ROLE regress_role_read_all_with_admin;
++SELECT * FROM data; -- success
++SET ROLE regress_role_read_12;
++SELECT * FROM data; -- success
++SET ROLE regress_role_read_34;
++SELECT * FROM data; -- error
++SET ROLE regress_role_inherited_34;
++SELECT * FROM data; -- error
++SET ROLE regress_role_inherited_3;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++
++SET SESSION AUTHORIZATION regress_role_read_12;
++VACUUM data; -- error
++SET ROLE pg_read_all_data; -- success
++
++SET SESSION AUTHORIZATION regress_role_inherited_34;
++SET ROLE pg_read_all_data; -- error
++SET ROLE regress_role_read_34; -- success
++
++SET SESSION AUTHORIZATION regress_role_inherited_3;
++SET ROLE pg_read_all_data; -- error
++SET ROLE regress_role_read_34; -- error
++
++SET SESSION AUTHORIZATION regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++SET ROLE pg_read_all_data; -- success
++SELECT * FROM data; -- success
++
++SET SESSION AUTHORIZATION regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_12; -- success
++SELECT * FROM data; -- success
++
++-- Test membership privileges (regression_db_2)
++\connect regression_db_2
++SET SESSION AUTHORIZATION regress_role_admin;
++SET ROLE regress_role_read_all_with_admin;
++SELECT * FROM data; -- success
++SET ROLE regress_role_read_12;
++SELECT * FROM data; -- success
++SET ROLE regress_role_read_34;
++SELECT * FROM data; -- error
++SET ROLE regress_role_inherited_34;
++SELECT * FROM data; -- error
++SET ROLE regress_role_inherited_3;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++
++SET SESSION AUTHORIZATION regress_role_read_12;
++VACUUM data; -- success
++SET ROLE pg_read_all_data; -- success
++
++SET SESSION AUTHORIZATION regress_role_inherited_34;
++SET ROLE pg_read_all_data; -- error
++SET ROLE regress_role_read_34; -- success
++
++SET SESSION AUTHORIZATION regress_role_inherited_3;
++SET ROLE pg_read_all_data; -- error
++SET ROLE regress_role_read_34; -- error
++
++SET SESSION AUTHORIZATION regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++SET ROLE pg_read_all_data; -- success
++SELECT * FROM data; -- success
++
++SET SESSION AUTHORIZATION regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_12; -- success
++SELECT * FROM data; -- success
++
++-- Test membership privileges (regression_db_3)
++\connect regression_db_3
++SET SESSION AUTHORIZATION regress_role_admin;
++SET ROLE regress_role_read_all_with_admin;
++SELECT * FROM data; -- success
++SET ROLE regress_role_read_12;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_34;
++SELECT * FROM data; -- success
++SET ROLE regress_role_inherited_34;
++SELECT * FROM data; -- success
++SET ROLE regress_role_inherited_3;
++SELECT * FROM data; -- success
++SET ROLE regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++
++SET SESSION AUTHORIZATION regress_role_read_12;
++SET ROLE pg_read_all_data; -- error
++
++SET SESSION AUTHORIZATION regress_role_inherited_34;
++SET ROLE pg_read_all_data; -- success
++SET ROLE regress_role_read_34; -- success
++
++SET SESSION AUTHORIZATION regress_role_inherited_3;
++SET ROLE pg_read_all_data; -- success
++SET ROLE regress_role_read_34; -- success
++
++SET SESSION AUTHORIZATION regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++SET ROLE pg_read_all_data; -- success
++SELECT * FROM data; -- success
++
++SET SESSION AUTHORIZATION regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_12; -- error
++SELECT * FROM data; -- error
++
++-- Test membership privileges (regression_db_4)
++\connect regression_db_4
++SET SESSION AUTHORIZATION regress_role_admin;
++SET ROLE regress_role_read_all_with_admin;
++SELECT * FROM data; -- success
++SET ROLE regress_role_read_12;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_34;
++SELECT * FROM data; -- success
++SET ROLE regress_role_inherited_34;
++SELECT * FROM data; -- success
++SET ROLE regress_role_inherited_3;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++
++SET SESSION AUTHORIZATION regress_role_read_12;
++SET ROLE pg_read_all_data; -- error
++
++SET SESSION AUTHORIZATION regress_role_inherited_34;
++SET ROLE pg_read_all_data; -- success
++SET ROLE regress_role_read_34; -- success
++
++SET SESSION AUTHORIZATION regress_role_inherited_3;
++SET ROLE pg_read_all_data; -- error
++SET ROLE regress_role_read_34; -- error
++
++SET SESSION AUTHORIZATION regress_role_read_all_noinherit;
++SELECT * FROM data; -- error
++SET ROLE pg_read_all_data; -- success
++SELECT * FROM data; -- success
++
++SET SESSION AUTHORIZATION regress_role_read_12_noinherit;
++SELECT * FROM data; -- error
++SET ROLE regress_role_read_12; -- error
++SELECT * FROM data; -- error
++
++\connect regression_db_0
++
++-- Test cluster-wide role
++SET SESSION AUTHORIZATION regress_role_read_0;
++SELECT query FROM pg_stat_activity WHERE datname = 'regression_db_0';
++SET SESSION AUTHORIZATION regress_role_read_12;
++SELECT query FROM pg_stat_activity WHERE datname = 'regression_db_0';
++
++\connect regression_db_3
++SET SESSION AUTHORIZATION regress_role_read_34;
++SELECT application_name, query FROM pg_stat_activity WHERE datname = 'regression_db_3';
++
++\connect regression_db_0
++SET SESSION AUTHORIZATION regress_role_admin;
++
++-- Should not warn if revoking admin option
++REVOKE ADMIN OPTION FOR pg_read_all_data FROM regress_role_read_0 IN DATABASE regression_db_0; -- silent
++REVOKE ADMIN OPTION FOR pg_read_all_data FROM regress_role_read_0 IN DATABASE regression_db_0; -- silent
++TABLE regress_role_memberships;
++
++-- Should warn if revoking a non-existent membership
++REVOKE pg_read_all_data FROM regress_role_read_0 IN DATABASE regression_db_0; -- success
++REVOKE pg_read_all_data FROM regress_role_read_0 IN DATABASE regression_db_0; -- warning
++TABLE regress_role_memberships;
++
++-- Revoke should only apply to the specified level
++REVOKE pg_read_all_data FROM regress_role_read_12; -- warning
++TABLE regress_role_memberships;
++
++-- Ensure cluster-wide admin option can grant cluster-wide and in specific databases
++CREATE ROLE regress_role_granted;
++SET SESSION AUTHORIZATION regress_role_read_all_with_admin;
++GRANT pg_read_all_data TO regress_role_granted; -- success
++GRANT pg_read_all_data TO regress_role_granted IN CURRENT DATABASE; -- success
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_1; -- success
++GRANT regress_role_read_34 TO regress_role_granted; -- error
++TABLE regress_role_memberships;
++
++-- Ensure database-specific admin option can only grant within that database
++SET SESSION AUTHORIZATION regress_role_read_34;
++GRANT pg_read_all_data TO regress_role_granted; -- error
++GRANT pg_read_all_data TO regress_role_granted IN CURRENT DATABASE; -- error
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_3; -- error
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_4; -- error
++
++\connect regression_db_3
++SET SESSION AUTHORIZATION regress_role_read_34;
++GRANT pg_read_all_data TO regress_role_granted; -- error
++GRANT pg_read_all_data TO regress_role_granted IN CURRENT DATABASE; -- success
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_3; -- notice
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_4; -- error
++
++\connect regression_db_4
++SET SESSION AUTHORIZATION regress_role_read_34;
++GRANT pg_read_all_data TO regress_role_granted; -- error
++GRANT pg_read_all_data TO regress_role_granted IN CURRENT DATABASE; -- success
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_3; -- error
++GRANT pg_read_all_data TO regress_role_granted IN DATABASE regression_db_4; -- notice
++
++\connect regression_db_0
++SET SESSION AUTHORIZATION regress_role_admin;
++TABLE regress_role_memberships;
++
++-- Should clean up the membership table when dropping a database
++DROP DATABASE regression_db_4;
++DROP DATABASE regression_db_3;
++DROP DATABASE regression_db_2;
++DROP DATABASE regression_db_1;
++TABLE regress_role_memberships;
++
++-- Should clean up the membership table when dropping a role
++DROP ROLE regress_role_granted;  -- dependency of 'regress_role_read_34'
++DROP ROLE regress_role_read_34;
++DROP ROLE regress_role_inherited_3;
++DROP ROLE regress_role_inherited_34;
++DROP ROLE regress_role_read_0;
++DROP ROLE regress_role_read_12;
++DROP ROLE regress_role_read_12_noinherit;
++DROP ROLE regress_role_read_all_noinherit;
++DROP ROLE regress_role_read_all_with_admin;
++
++RESET SESSION AUTHORIZATION;
++DROP OWNED BY regress_role_admin CASCADE;
++TABLE regress_role_memberships;
++\connect template1
++DROP DATABASE regression_db_0;
++DROP ROLE regress_role_admin;
++SELECT datname FROM pg_database WHERE datname LIKE 'regression_db_%';
++SELECT rolname FROM pg_roles WHERE rolname LIKE 'regress_role_%';
+
+base-commit: 4572d59e3c9b0ef6c056544b6336561efd9bb5ec
+-- 
+2.39.5
+
