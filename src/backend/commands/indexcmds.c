@@ -2984,7 +2984,7 @@ ReindexMultipleTables(const ReindexStmt *stmt, const ReindexParams *params)
 		objectOid = get_namespace_oid(objectName, false);
 
 		if (!object_ownercheck(NamespaceRelationId, objectOid, GetUserId()) &&
-			!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN))
+			!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN, MyDatabaseId))
 			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SCHEMA,
 						   objectName);
 	}
@@ -2997,7 +2997,7 @@ ReindexMultipleTables(const ReindexStmt *stmt, const ReindexParams *params)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("can only reindex the currently open database")));
 		if (!object_ownercheck(DatabaseRelationId, objectOid, GetUserId()) &&
-			!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN))
+			!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN, MyDatabaseId))
 			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 						   get_database_name(objectOid));
 	}

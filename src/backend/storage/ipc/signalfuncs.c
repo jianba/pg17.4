@@ -45,6 +45,8 @@
 #define SIGNAL_BACKEND_ERROR 1
 #define SIGNAL_BACKEND_NOPERMISSION 2
 #define SIGNAL_BACKEND_NOSUPERUSER 3
+#define SIGNAL_BACKEND_NOAUTOVAC 4
+
 static int
 pg_signal_backend(int pid, int sig)
 {
@@ -74,18 +76,47 @@ pg_signal_backend(int pid, int sig)
 		return SIGNAL_BACKEND_ERROR;
 	}
 
+	// /*
+	//  * Only allow superusers to signal superuser-owned backends.  Any process
+	//  * not advertising a role might have the importance of a superuser-owned
+	//  * backend, so treat it that way.
+	//  */
+	// if ((!OidIsValid(proc->roleId) || superuser_arg(proc->roleId)) &&
+	// 	!superuser())
+	// 	return SIGNAL_BACKEND_NOSUPERUSER;
+
+	// /* Users can signal backends they have role membership in. */
+	// if (!has_privs_of_role(GetUserId(), proc->roleId) &&
+	// 	!has_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_BACKEND))
+	// 	return SIGNAL_BACKEND_NOPERMISSION;
+
 	/*
 	 * Only allow superusers to signal superuser-owned backends.  Any process
 	 * not advertising a role might have the importance of a superuser-owned
-	 * backend, so treat it that way.
+	 * backend, so treat it that way.  As an exception, we allow roles with
+	 * privileges of pg_signal_autovacuum_worker to signal autovacuum workers
+	 * (which do not advertise a role).
+	 *
+	 * Otherwise, users can signal backends for roles they have privileges of.
 	 */
-	if ((!OidIsValid(proc->roleId) || superuser_arg(proc->roleId)) &&
-		!superuser())
-		return SIGNAL_BACKEND_NOSUPERUSER;
+	if (!OidIsValid(proc->roleId) || superuser_arg(proc->roleId))
+	{
+		ProcNumber	procNumber = GetNumberFromPGProc(proc);
+		BackendType backendType = pgstat_get_backend_type_by_proc_number(procNumber);
 
-	/* Users can signal backends they have role membership in. */
-	if (!has_privs_of_role(GetUserId(), proc->roleId) &&
-		!has_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_BACKEND))
+		if (backendType == B_AUTOVAC_WORKER)
+		{
+			// if (!has_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_AUTOVACUUM_WORKER))
+			if (!has_cluster_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_AUTOVACUUM_WORKER))
+				return SIGNAL_BACKEND_NOAUTOVAC;
+		}
+		else if (!superuser())
+			return SIGNAL_BACKEND_NOSUPERUSER;
+	}
+	// else if (!has_privs_of_role(GetUserId(), proc->roleId) &&
+	// 		 !has_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_BACKEND))
+	else if (!has_cluster_privs_of_role(GetUserId(), proc->roleId) &&
+			 !has_cluster_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_BACKEND))
 		return SIGNAL_BACKEND_NOPERMISSION;
 
 	/*

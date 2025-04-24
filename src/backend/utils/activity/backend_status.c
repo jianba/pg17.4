@@ -1195,3 +1195,22 @@ pgstat_clip_activity(const char *raw_activity)
 
 	return activity;
 }
+
+/* ----------
+ * cmp_lbestatus
+ *
+ *	Comparison function for bsearch() on an array of LocalPgBackendStatus.
+ *	The proc_number field is used to compare the arguments.
+ * ----------
+ */
+BackendType
+pgstat_get_backend_type_by_proc_number(ProcNumber procNumber)
+{
+	volatile PgBackendStatus *status = &BackendStatusArray[procNumber];
+
+	/*
+	 * We bypass the changecount mechanism since fetching and storing an int
+	 * is almost certainly atomic.
+	 */
+	return status->st_backendType;
+}
